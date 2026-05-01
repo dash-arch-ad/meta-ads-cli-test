@@ -39,7 +39,7 @@ schedule:
 rules:
   - name: zero_purchase_64000_pause
     level: ad
-    window: "maximum"
+    window: "last_90d"
     spend_gt: 50000
     conversions_lt: 1
     action: pause_ad
