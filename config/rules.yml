@@ -12,7 +12,7 @@ meta_cli:
     - "{ad_account_id}"
     - "insights"
     - "get"
-    - "--campaign_id"
+    - "--campaign-id"
     - "{campaign_id}"
     - "--date-preset"
     - "{window}"
