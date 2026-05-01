@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import subprocess
@@ -304,22 +305,65 @@ def number(value: Any, default: float = 0.0) -> float:
         return default
     if isinstance(value, (int, float)):
         return float(value)
-    return float(str(value).replace(",", ""))
+    try:
+        return float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return default
+
+
+def parse_action_list(value: Any) -> list[dict[str, Any]]:
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if not isinstance(value, str) or not value.strip():
+        return []
+    text = value.strip()
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        try:
+            payload = ast.literal_eval(text)
+        except (ValueError, SyntaxError):
+            return []
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    return []
+
+
+def action_value(actions: list[dict[str, Any]], conversion_event: str) -> float | None:
+    candidates = {conversion_event}
+    if conversion_event == "purchase":
+        candidates.update(
+            {
+                "purchase",
+                "omni_purchase",
+                "offsite_conversion.fb_pixel_purchase",
+                "offsite_conversion.fb_pixel_custom.purchase",
+                "onsite_conversion.purchase",
+            }
+        )
+
+    total = 0.0
+    found = False
+    for action in actions:
+        action_type = str(action.get("action_type") or action.get("type") or action.get("name") or "")
+        if action_type in candidates or action_type.endswith(f".{conversion_event}"):
+            total += number(action.get("value") or action.get("count"))
+            found = True
+    return total if found else None
 
 
 def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
+    action_sources: list[dict[str, Any]] = []
+    for key in ("actions", "conversions"):
+        action_sources.extend(parse_action_list(ad.get(key)))
+
+    from_actions = action_value(action_sources, conversion_event)
+    if from_actions is not None:
+        return from_actions
+
     for key in ("conversions", "conversion_count", "cv"):
         if key in ad:
             return number(ad.get(key))
-
-    actions = ad.get("actions") or []
-    if isinstance(actions, list):
-        for action in actions:
-            if not isinstance(action, dict):
-                continue
-            action_type = action.get("action_type") or action.get("type") or action.get("name")
-            if action_type == conversion_event:
-                return number(action.get("value") or action.get("count"))
     return 0.0
 
 
