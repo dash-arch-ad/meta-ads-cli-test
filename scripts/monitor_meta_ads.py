@@ -26,6 +26,11 @@ ALLOWED_ACTIONS = {"pause_ad"}
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
 DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,status"
+DATE_PRESET_FALLBACKS = {
+    "maximum": "last_90d",
+    "max": "last_90d",
+    "37_months": "last_90d",
+}
 
 
 @dataclass(frozen=True)
@@ -254,6 +259,31 @@ def choose_option(help_text: str, options: list[str], required: bool = True) -> 
     return None
 
 
+def allowed_date_presets(help_text: str) -> set[str]:
+    presets = {
+        "today",
+        "yesterday",
+        "last_3d",
+        "last_7d",
+        "last_14d",
+        "last_30d",
+        "last_90d",
+        "this_month",
+        "last_month",
+    }
+    return {preset for preset in presets if preset in help_text} or presets
+
+
+def normalize_date_preset(window: str, help_text: str) -> str:
+    preset = DATE_PRESET_FALLBACKS.get(window, window)
+    allowed = allowed_date_presets(help_text)
+    if preset in allowed:
+        return preset
+    if "last_90d" in allowed:
+        return "last_90d"
+    raise RuntimeError(f"Unsupported date preset for Meta Ads CLI: {redact_text(window)}")
+
+
 def parse_json_output(stdout: str) -> list[dict[str, Any]]:
     if not stdout:
         return []
@@ -393,7 +423,7 @@ def build_insights_args(
         campaign_option,
         campaign_id,
         date_option,
-        insights_window(config),
+        normalize_date_preset(insights_window(config), help_text),
         fields_option,
         fields,
     ]
