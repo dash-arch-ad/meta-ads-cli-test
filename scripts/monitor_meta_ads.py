@@ -119,6 +119,10 @@ def sanitize_cli_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sanitize_cli_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_cli_result(result) for result in results]
+
+
 def public_ad_ref(ad_id: Any) -> str:
     return f"ad_{short_hash(ad_id)}"
 
@@ -349,15 +353,29 @@ def insights_window(config: dict[str, Any]) -> str:
     return next(iter(windows))
 
 
-def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cli = config.get("meta_cli") or {}
     executable = cli.get("executable", "meta")
     args_template = cli.get("insights_args") or []
-    args = format_args(args_template, {"ad_account_id": ad_account_id, "window": insights_window(config)})
-    result = run_cli(executable, args)
-    if result["returncode"] != 0:
-        raise RuntimeError(f"Meta Ads CLI insights command failed: {result['stderr'] or result['stdout']}")
-    return parse_json_output(result["stdout"]), result
+    all_ads: list[dict[str, Any]] = []
+    results: list[dict[str, Any]] = []
+
+    for campaign_id in allowed_campaign_ids_from_config_or_env(config):
+        args = format_args(
+            args_template,
+            {
+                "ad_account_id": ad_account_id,
+                "campaign_id": campaign_id,
+                "window": insights_window(config),
+            },
+        )
+        result = run_cli(executable, args)
+        results.append(result)
+        if result["returncode"] != 0:
+            raise RuntimeError(f"Meta Ads CLI insights command failed: {result['stderr'] or result['stdout']}")
+        all_ads.extend(parse_json_output(result["stdout"]))
+
+    return all_ads, results
 
 
 def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
@@ -468,7 +486,7 @@ def main() -> int:
         limited_matches = matches[:max_pauses]
 
         run_record["ads_fetched"] = len(ads)
-        run_record["meta_cli_fetch"] = sanitize_cli_result(fetch_result)
+        run_record["meta_cli_fetch"] = sanitize_cli_results(fetch_result)
         run_record["matched_ads"] = [
             sanitize_match(match, match in limited_matches)
             for match in matches
