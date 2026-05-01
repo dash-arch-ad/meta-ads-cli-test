@@ -1,0 +1,51 @@
+mode: active
+
+meta:
+  ad_account_id: "act_xxxxxxxxxx"
+  conversion_event: "purchase"
+
+meta_cli:
+  executable: "meta"
+  insights_args:
+    - "ads"
+    - "insights"
+    - "get"
+    - "--account"
+    - "{ad_account_id}"
+    - "--level"
+    - "ad"
+    - "--time-range"
+    - "{window}"
+    - "--fields"
+    - "ad_id,ad_name,campaign_id,campaign_name,spend,actions,status"
+    - "--format"
+    - "json"
+  pause_args:
+    - "ads"
+    - "ad"
+    - "update"
+    - "{ad_id}"
+    - "--status"
+    - "PAUSED"
+
+target:
+  allowed_campaign_ids:
+    - "SET_META_ALLOWED_CAMPAIGN_IDS_IN_SECRET"
+
+schedule:
+  interval_minutes: 30
+
+rules:
+  - name: zero_purchase_64000_pause
+    level: ad
+    window: "maximum"
+    spend_gt: 50000
+    conversions_lt: 1
+    action: pause_ad
+
+safety:
+  max_pauses_per_run: 100
+  allow_delete: false
+  allow_campaign_change: false
+  allow_adset_change: false
+  allow_budget_change: false
