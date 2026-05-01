@@ -25,6 +25,7 @@ ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
+DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,status"
 
 
 @dataclass(frozen=True)
@@ -236,6 +237,23 @@ def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
     }
 
 
+def cli_help(executable: str, args: list[str]) -> str:
+    result = run_cli(executable, [*args, "-h"])
+    text = "\n".join(part for part in (result.get("stdout"), result.get("stderr")) if part)
+    if result["returncode"] != 0 or not text:
+        raise RuntimeError(f"Could not read Meta Ads CLI help for {' '.join(args)}: {redact_text(text)}")
+    return text
+
+
+def choose_option(help_text: str, options: list[str], required: bool = True) -> str | None:
+    for option in options:
+        if option in help_text:
+            return option
+    if required:
+        raise RuntimeError(f"Meta Ads CLI help did not include any supported option: {', '.join(options)}")
+    return None
+
+
 def parse_json_output(stdout: str) -> list[dict[str, Any]]:
     if not stdout:
         return []
@@ -353,22 +371,45 @@ def insights_window(config: dict[str, Any]) -> str:
     return next(iter(windows))
 
 
+def build_insights_args(
+    config: dict[str, Any],
+    executable: str,
+    ad_account_id: str,
+    campaign_id: str,
+) -> list[str]:
+    help_text = cli_help(executable, ["ads", "insights", "get"])
+    campaign_option = choose_option(help_text, ["--campaign-id", "--campaign_id"])
+    date_option = choose_option(help_text, ["--date-preset", "--date_preset"])
+    fields_option = choose_option(help_text, ["--fields"])
+    output_option = choose_option(help_text, ["--output", "--format"], required=False)
+    fields = (config.get("meta_cli") or {}).get("insights_fields", DEFAULT_INSIGHTS_FIELDS)
+
+    args = [
+        "ads",
+        "--ad-account-id",
+        ad_account_id,
+        "insights",
+        "get",
+        campaign_option,
+        campaign_id,
+        date_option,
+        insights_window(config),
+        fields_option,
+        fields,
+    ]
+    if output_option:
+        args.extend([output_option, "json"])
+    return args
+
+
 def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cli = config.get("meta_cli") or {}
     executable = cli.get("executable", "meta")
-    args_template = cli.get("insights_args") or []
     all_ads: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
 
     for campaign_id in allowed_campaign_ids_from_config_or_env(config):
-        args = format_args(
-            args_template,
-            {
-                "ad_account_id": ad_account_id,
-                "campaign_id": campaign_id,
-                "window": insights_window(config),
-            },
-        )
+        args = build_insights_args(config, executable, ad_account_id, campaign_id)
         result = run_cli(executable, args)
         results.append(result)
         if result["returncode"] != 0:
