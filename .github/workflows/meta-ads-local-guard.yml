@@ -3,8 +3,8 @@ name: Meta Ads Local Guard
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/30 * * * *"
-
+    - cron: "7,37 * * * *"
+    
 jobs:
   monitor:
     runs-on: ubuntu-latest
