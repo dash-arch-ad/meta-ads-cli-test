@@ -22,11 +22,13 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RUNS_LOG = PROJECT_ROOT / "logs" / "runs.log"
 PAUSED_LOG = PROJECT_ROOT / "logs" / "paused_ads.log"
+
 ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
 DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions"
+
 DATE_PRESET_FALLBACKS = {
     "maximum": "last_90d",
     "max": "last_90d",
@@ -48,10 +50,12 @@ def utc_now_iso() -> str:
 def load_dotenv(path: Path) -> None:
     if not path.exists():
         return
+
     for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
+
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
@@ -61,8 +65,10 @@ def load_dotenv(path: Path) -> None:
 def sync_meta_cli_env() -> None:
     meta_token = os.getenv("META_ACCESS_TOKEN")
     meta_account_id = os.getenv("META_AD_ACCOUNT_ID")
+
     if meta_token:
         os.environ.setdefault("ACCESS_TOKEN", meta_token)
+
     if meta_account_id:
         os.environ.setdefault("AD_ACCOUNT_ID", meta_account_id.removeprefix("act_"))
 
@@ -70,8 +76,10 @@ def sync_meta_cli_env() -> None:
 def load_config(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as fh:
         config = yaml.safe_load(fh) or {}
+
     if not isinstance(config, dict):
         raise ValueError("Config root must be a mapping.")
+
     return config
 
 
@@ -87,6 +95,7 @@ def short_hash(value: Any) -> str:
 
 def secret_values() -> list[str]:
     values: list[str] = []
+
     for key, value in os.environ.items():
         if not value:
             continue
@@ -114,14 +123,17 @@ def secret_values() -> list[str]:
 
 def redact_text(value: Any) -> str:
     text = str(value)
+
     for secret in secret_values():
         if secret:
             text = text.replace(secret, "[REDACTED]")
+
     return text
 
 
 def sanitize_cli_result(result: dict[str, Any]) -> dict[str, Any]:
     command = result.get("command") or []
+
     return {
         "command": [redact_text(part) for part in command],
         "returncode": result.get("returncode"),
@@ -154,12 +166,16 @@ def sanitize_match(match: Match, selected_for_pause: bool) -> dict[str, Any]:
 
 def sanitize_chatwork_result(result: dict[str, Any]) -> dict[str, Any]:
     sanitized = dict(result)
+
     if "response" in sanitized:
         sanitized["response"] = "[REDACTED]"
+
     if "error" in sanitized:
         sanitized["error"] = redact_text(sanitized["error"])[:500]
+
     if "reason" in sanitized:
         sanitized["reason"] = redact_text(sanitized["reason"])
+
     return sanitized
 
 
@@ -179,7 +195,6 @@ def sanitize_paused_record(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
-    """Return only non-secret rule fields for logs."""
     allowed_keys = {
         "name",
         "level",
@@ -192,6 +207,7 @@ def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
         "max_cpa",
         "action",
     }
+
     return {key: rule.get(key) for key in allowed_keys if key in rule}
 
 
@@ -207,6 +223,7 @@ def require_safe_config(config: dict[str, Any]) -> None:
         "allow_adset_change": False,
         "allow_budget_change": False,
     }
+
     for key, required in forbidden_flags.items():
         if safety.get(key) is not required:
             raise ValueError(f"Unsafe config: safety.{key} must be {required}.")
@@ -217,27 +234,40 @@ def require_safe_config(config: dict[str, Any]) -> None:
 
     allowed_campaign_ids = allowed_campaign_ids_from_config_or_env(config)
     if not allowed_campaign_ids:
-        raise ValueError("Unsafe config: META_ALLOWED_CAMPAIGN_IDS or target.allowed_campaign_ids must not be empty.")
+        raise ValueError(
+            "Unsafe config: META_ALLOWED_CAMPAIGN_IDS or target.allowed_campaign_ids must not be empty."
+        )
 
     for rule in config.get("rules") or []:
         if rule.get("level") != "ad":
             raise ValueError(f"Unsupported rule level for {rule.get('name')}: only ad is allowed.")
+
         if rule.get("action") not in ALLOWED_ACTIONS:
-            raise ValueError(f"Unsupported rule action for {rule.get('name')}: only pause_ad is allowed.")
+            raise ValueError(
+                f"Unsupported rule action for {rule.get('name')}: only pause_ad is allowed."
+            )
 
 
 def resolve_ad_account_id(config: dict[str, Any]) -> str:
     account_id = os.getenv("META_AD_ACCOUNT_ID") or (config.get("meta") or {}).get("ad_account_id")
+
     if not account_id or account_id == "act_xxxxxxxxxx":
         raise ValueError("META_AD_ACCOUNT_ID or meta.ad_account_id must be set.")
+
     return account_id
 
 
 def allowed_campaign_ids_from_config_or_env(config: dict[str, Any]) -> list[str]:
     env_value = os.getenv("META_ALLOWED_CAMPAIGN_IDS", "")
+
     if env_value.strip():
         normalized = env_value.replace("\n", ",")
-        return [item.strip().strip('"').strip("'") for item in normalized.split(",") if item.strip()]
+        return [
+            item.strip().strip('"').strip("'")
+            for item in normalized.split(",")
+            if item.strip()
+        ]
+
     return [
         str(cid)
         for cid in ((config.get("target") or {}).get("allowed_campaign_ids") or [])
@@ -256,6 +286,7 @@ def format_args(args: list[str], values: dict[str, Any]) -> list[str]:
 
 def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
     command = [executable, *args]
+
     completed = subprocess.run(
         command,
         check=False,
@@ -263,6 +294,7 @@ def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
         text=True,
         encoding="utf-8",
     )
+
     return {
         "command": command,
         "returncode": completed.returncode,
@@ -274,8 +306,12 @@ def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
 def cli_help(executable: str, args: list[str]) -> str:
     result = run_cli(executable, [*args, "-h"])
     text = "\n".join(part for part in (result.get("stdout"), result.get("stderr")) if part)
+
     if result["returncode"] != 0 or not text:
-        raise RuntimeError(f"Could not read Meta Ads CLI help for {' '.join(args)}: {redact_text(text)}")
+        raise RuntimeError(
+            f"Could not read Meta Ads CLI help for {' '.join(args)}: {redact_text(text)}"
+        )
+
     return text
 
 
@@ -283,8 +319,12 @@ def choose_option(help_text: str, options: list[str], required: bool = True) -> 
     for option in options:
         if option in help_text:
             return option
+
     if required:
-        raise RuntimeError(f"Meta Ads CLI help did not include any supported option: {', '.join(options)}")
+        raise RuntimeError(
+            f"Meta Ads CLI help did not include any supported option: {', '.join(options)}"
+        )
+
     return None
 
 
@@ -300,39 +340,50 @@ def allowed_date_presets(help_text: str) -> set[str]:
         "this_month",
         "last_month",
     }
+
     return {preset for preset in presets if preset in help_text} or presets
 
 
 def normalize_date_preset(window: str, help_text: str) -> str:
     preset = DATE_PRESET_FALLBACKS.get(window, window)
     allowed = allowed_date_presets(help_text)
+
     if preset in allowed:
         return preset
+
     if "last_90d" in allowed:
         return "last_90d"
+
     raise RuntimeError(f"Unsupported date preset for Meta Ads CLI: {redact_text(window)}")
 
 
 def parse_json_output(stdout: str) -> list[dict[str, Any]]:
     if not stdout:
         return []
+
     payload = json.loads(stdout)
+
     if isinstance(payload, list):
         return [row for row in payload if isinstance(row, dict)]
+
     if isinstance(payload, dict):
         for key in ("data", "results", "ads", "insights"):
             value = payload.get(key)
             if isinstance(value, list):
                 return [row for row in value if isinstance(row, dict)]
+
         return [payload]
+
     raise ValueError("Meta Ads CLI output must be a JSON object or array.")
 
 
 def number(value: Any, default: float = 0.0) -> float:
     if value is None or value == "":
         return default
+
     if isinstance(value, (int, float)):
         return float(value)
+
     try:
         return float(str(value).replace(",", ""))
     except (TypeError, ValueError):
@@ -342,9 +393,12 @@ def number(value: Any, default: float = 0.0) -> float:
 def parse_action_list(value: Any) -> list[dict[str, Any]]:
     if isinstance(value, list):
         return [item for item in value if isinstance(item, dict)]
+
     if not isinstance(value, str) or not value.strip():
         return []
+
     text = value.strip()
+
     try:
         payload = json.loads(text)
     except json.JSONDecodeError:
@@ -352,13 +406,16 @@ def parse_action_list(value: Any) -> list[dict[str, Any]]:
             payload = ast.literal_eval(text)
         except (ValueError, SyntaxError):
             return []
+
     if isinstance(payload, list):
         return [item for item in payload if isinstance(item, dict)]
+
     return []
 
 
 def action_value(actions: list[dict[str, Any]], conversion_event: str) -> float | None:
     candidates = {conversion_event}
+
     if conversion_event == "purchase":
         candidates.update(
             {
@@ -372,26 +429,37 @@ def action_value(actions: list[dict[str, Any]], conversion_event: str) -> float 
 
     total = 0.0
     found = False
+
     for action in actions:
-        action_type = str(action.get("action_type") or action.get("type") or action.get("name") or "")
+        action_type = str(
+            action.get("action_type")
+            or action.get("type")
+            or action.get("name")
+            or ""
+        )
+
         if action_type in candidates or action_type.endswith(f".{conversion_event}"):
             total += number(action.get("value") or action.get("count"))
             found = True
+
     return total if found else None
 
 
 def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
     action_sources: list[dict[str, Any]] = []
+
     for key in ("actions", "conversions"):
         action_sources.extend(parse_action_list(ad.get(key)))
 
     from_actions = action_value(action_sources, conversion_event)
+
     if from_actions is not None:
         return from_actions
 
     for key in ("conversions", "conversion_count", "cv"):
         if key in ad:
             return number(ad.get(key))
+
     return 0.0
 
 
@@ -399,6 +467,7 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     spend = number(raw.get("spend"))
     conversions = conversions_from_ad(raw, conversion_event)
     cpa = spend / conversions if conversions > 0 else None
+
     return {
         **raw,
         "ad_id": str(raw.get("ad_id") or raw.get("id") or ""),
@@ -412,7 +481,10 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     }
 
 
-def evaluate_rule_with_diagnostic(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
+def evaluate_rule_with_diagnostic(
+    ad: dict[str, Any],
+    rule: dict[str, Any],
+) -> tuple[str | None, dict[str, Any]]:
     spend = float(ad["spend"])
     conversions = float(ad["conversions"])
     cpa = ad["cpa"]
@@ -437,17 +509,23 @@ def evaluate_rule_with_diagnostic(ad: dict[str, Any], rule: dict[str, Any]) -> t
 
     if "conversions_lt" in rule and conversions >= float(rule["conversions_lt"]):
         diagnostic["decision"] = "conversions_not_lt"
-        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['conversions_lt']):g}"
+        diagnostic["detail"] = (
+            f"conversions={conversions:g} threshold={float(rule['conversions_lt']):g}"
+        )
         return None, diagnostic
 
     if "min_conversions" in rule and conversions < float(rule["min_conversions"]):
         diagnostic["decision"] = "conversions_below_min"
-        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['min_conversions']):g}"
+        diagnostic["detail"] = (
+            f"conversions={conversions:g} threshold={float(rule['min_conversions']):g}"
+        )
         return None, diagnostic
 
     if "max_conversions" in rule and conversions > float(rule["max_conversions"]):
         diagnostic["decision"] = "conversions_above_max"
-        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['max_conversions']):g}"
+        diagnostic["detail"] = (
+            f"conversions={conversions:g} threshold={float(rule['max_conversions']):g}"
+        )
         return None, diagnostic
 
     if "max_cpa" in rule:
@@ -455,6 +533,7 @@ def evaluate_rule_with_diagnostic(ad: dict[str, Any], rule: dict[str, Any]) -> t
             diagnostic["decision"] = "cpa_none"
             diagnostic["detail"] = "cpa=None"
             return None, diagnostic
+
         if cpa < float(rule["max_cpa"]):
             diagnostic["decision"] = "cpa_below_threshold"
             diagnostic["detail"] = f"cpa={cpa:g} threshold={float(rule['max_cpa']):g}"
@@ -465,6 +544,7 @@ def evaluate_rule_with_diagnostic(ad: dict[str, Any], rule: dict[str, Any]) -> t
         f"spend={spend:g}",
         f"conversions={conversions:g}",
     ]
+
     if cpa is not None:
         reason_parts.append(f"cpa={cpa:g}")
 
@@ -556,10 +636,13 @@ def insights_window(config: dict[str, Any]) -> str:
         for rule in (config.get("rules") or [])
         if rule.get("window")
     }
+
     if not windows:
         return "24h"
+
     if len(windows) > 1:
         raise ValueError("All initial rules must use the same window for one CLI insights call.")
+
     return next(iter(windows))
 
 
@@ -570,10 +653,17 @@ def build_insights_args(
     campaign_id: str,
 ) -> list[str]:
     help_text = cli_help(executable, ["ads", "insights", "get"])
+
     campaign_option = choose_option(help_text, ["--campaign-id", "--campaign_id"])
     date_option = choose_option(help_text, ["--date-preset", "--date_preset"])
     fields_option = choose_option(help_text, ["--fields"])
     output_option = choose_option(help_text, ["--output", "--format"], required=False)
+
+    # Important:
+    # Without level=ad, some Meta CLI versions return campaign-level insights.
+    # Campaign-level rows do not contain ad_id, so ad pause cannot work.
+    level_option = choose_option(help_text, ["--level"], required=False)
+
     fields = (config.get("meta_cli") or {}).get("insights_fields", DEFAULT_INSIGHTS_FIELDS)
 
     args = [
@@ -586,17 +676,55 @@ def build_insights_args(
         campaign_id,
         date_option,
         normalize_date_preset(insights_window(config), help_text),
-        fields_option,
-        fields,
     ]
+
+    if level_option:
+        args.extend([level_option, "ad"])
+
+    args.extend(
+        [
+            fields_option,
+            fields,
+        ]
+    )
+
     if output_option:
         args.extend([output_option, "json"])
+
     return args
 
 
-def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+def ensure_ad_level_insights(rows: list[dict[str, Any]]) -> None:
+    """Fail loudly when insights are not ad-level rows.
+
+    This monitor pauses ads. Therefore, actionable rows must contain ad_id or id.
+    If Meta CLI returns campaign-level aggregate rows, continuing silently is dangerous:
+    the script looks healthy but cannot pause anything.
+    """
+    if not rows:
+        return
+
+    missing_ad_id_rows = [row for row in rows if not (row.get("ad_id") or row.get("id"))]
+
+    if missing_ad_id_rows and len(missing_ad_id_rows) == len(rows):
+        sample = missing_ad_id_rows[0]
+        safe_keys = sorted(str(key) for key in sample.keys())
+
+        raise RuntimeError(
+            "Meta Ads CLI insights did not return ad-level rows. "
+            "No ad_id was present, so ads cannot be paused. "
+            "Use insights with '--level ad', or use a CLI/API method that returns ad_id. "
+            f"Returned keys: {safe_keys}"
+        )
+
+
+def fetch_insights(
+    config: dict[str, Any],
+    ad_account_id: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     cli = config.get("meta_cli") or {}
     executable = cli.get("executable", "meta")
+
     all_ads: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
 
@@ -604,9 +732,15 @@ def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dic
         args = build_insights_args(config, executable, ad_account_id, campaign_id)
         result = run_cli(executable, args)
         results.append(result)
+
         if result["returncode"] != 0:
-            raise RuntimeError(f"Meta Ads CLI insights command failed: {result['stderr'] or result['stdout']}")
-        all_ads.extend(parse_json_output(result["stdout"]))
+            raise RuntimeError(
+                f"Meta Ads CLI insights command failed: {result['stderr'] or result['stdout']}"
+            )
+
+        rows = parse_json_output(result["stdout"])
+        ensure_ad_level_insights(rows)
+        all_ads.extend(rows)
 
     return all_ads, results
 
@@ -614,11 +748,18 @@ def fetch_insights(config: dict[str, Any], ad_account_id: str) -> tuple[list[dic
 def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
     cli = config.get("meta_cli") or {}
     executable = cli.get("executable", "meta")
+
     args_template = cli.get("pause_args") or []
     args = format_args(args_template, {"ad_id": ad_id, "status": PAUSED_STATUS})
+
     result = run_cli(executable, args)
+
     if result["returncode"] != 0:
-        raise RuntimeError(f"Meta Ads CLI pause command failed for {public_ad_ref(ad_id)}: {redact_text(result['stderr'] or result['stdout'])}")
+        raise RuntimeError(
+            f"Meta Ads CLI pause command failed for {public_ad_ref(ad_id)}: "
+            f"{redact_text(result['stderr'] or result['stdout'])}"
+        )
+
     return result
 
 
@@ -640,6 +781,7 @@ def build_chatwork_message(paused_record: dict[str, Any]) -> str:
 def notify_chatwork(message: str) -> dict[str, Any]:
     token = os.getenv("CHATWORK_API_TOKEN")
     room_id = os.getenv("CHATWORK_ROOM_ID")
+
     if not token or not room_id:
         return {
             "enabled": False,
@@ -649,6 +791,7 @@ def notify_chatwork(message: str) -> dict[str, Any]:
 
     url = f"https://api.chatwork.com/v2/rooms/{room_id}/messages"
     data = urllib.parse.urlencode({"body": message, "self_unread": "0"}).encode("utf-8")
+
     request = urllib.request.Request(
         url,
         data=data,
@@ -668,6 +811,7 @@ def notify_chatwork(message: str) -> dict[str, Any]:
                 "status": response.status,
                 "response": body,
             }
+
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         return {
@@ -676,6 +820,7 @@ def notify_chatwork(message: str) -> dict[str, Any]:
             "status": exc.code,
             "error": body,
         }
+
     except Exception as exc:
         return {
             "enabled": True,
@@ -691,6 +836,7 @@ def main() -> int:
 
     load_dotenv(PROJECT_ROOT / ".env")
     sync_meta_cli_env()
+
     config_path = Path(args.config).resolve()
 
     run_record: dict[str, Any] = {
@@ -724,7 +870,10 @@ def main() -> int:
         ]
 
         ads, fetch_result = fetch_insights(config, ad_account_id)
-        matches, ad_diagnostics, evaluation_summary = find_matches_with_diagnostics(ads, config)
+        matches, ad_diagnostics, evaluation_summary = find_matches_with_diagnostics(
+            ads,
+            config,
+        )
         limited_matches = matches[:max_pauses]
 
         run_record["ads_fetched"] = len(ads)
@@ -739,6 +888,7 @@ def main() -> int:
         if mode == "active":
             for match in limited_matches:
                 pause_result = pause_ad(config, match.ad["ad_id"])
+
                 paused_record = {
                     "timestamp": utc_now_iso(),
                     "ad_account_id": ad_account_id,
@@ -750,6 +900,7 @@ def main() -> int:
                     "paused": True,
                     "meta_cli_result": pause_result,
                 }
+
                 chatwork_result = notify_chatwork(build_chatwork_message(paused_record))
                 paused_record["chatwork_notification"] = chatwork_result
 
@@ -762,6 +913,7 @@ def main() -> int:
                 sanitized_paused_record = sanitize_paused_record(paused_record)
                 run_record["paused_ads"].append(sanitized_paused_record)
                 append_jsonl(PAUSED_LOG, sanitized_paused_record)
+
         else:
             for match in limited_matches:
                 run_record["paused_ads"].append(
