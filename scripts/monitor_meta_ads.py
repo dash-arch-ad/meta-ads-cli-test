@@ -20,8 +20,6 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-RUNS_LOG = PROJECT_ROOT / "logs" / "runs.log"
-PAUSED_LOG = PROJECT_ROOT / "logs" / "paused_ads.log"
 
 ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
@@ -83,14 +81,16 @@ def load_config(path: Path) -> dict[str, Any]:
     return config
 
 
-def append_jsonl(path: Path, record: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as fh:
-        fh.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-
-
 def short_hash(value: Any) -> str:
     return sha256(str(value).encode("utf-8")).hexdigest()[:12]
+
+
+def public_ad_ref(ad_id: Any) -> str:
+    return f"ad_{short_hash(ad_id)}"
+
+
+def public_campaign_ref(campaign_id: Any) -> str:
+    return f"campaign_{short_hash(campaign_id)}"
 
 
 def secret_values() -> list[str]:
@@ -131,67 +131,10 @@ def redact_text(value: Any) -> str:
     return text
 
 
-def sanitize_command_like_result(result: dict[str, Any]) -> dict[str, Any]:
-    command = result.get("command") or []
-
+def sanitized_cli_summary(result: dict[str, Any]) -> dict[str, Any]:
     return {
-        "command": [redact_text(part) for part in command],
         "returncode": result.get("returncode"),
-        "stdout_bytes": len(result.get("stdout") or ""),
-        "stderr_preview": redact_text(result.get("stderr") or "")[:500],
-    }
-
-
-def sanitize_command_like_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [sanitize_command_like_result(result) for result in results]
-
-
-def public_ad_ref(ad_id: Any) -> str:
-    return f"ad_{short_hash(ad_id)}"
-
-
-def public_campaign_ref(campaign_id: Any) -> str:
-    return f"campaign_{short_hash(campaign_id)}"
-
-
-def sanitize_match(match: Match, selected_for_pause: bool) -> dict[str, Any]:
-    return {
-        "ad_ref": public_ad_ref(match.ad["ad_id"]),
-        "campaign_ref": public_campaign_ref(match.ad.get("campaign_id")),
-        "rule": match.rule.get("name"),
-        "status": match.ad.get("status") or "",
-        "selected_for_pause": selected_for_pause,
-    }
-
-
-def sanitize_chatwork_result(result: dict[str, Any]) -> dict[str, Any]:
-    sanitized = dict(result)
-
-    if "response" in sanitized:
-        sanitized["response"] = "[REDACTED]"
-
-    if "error" in sanitized:
-        sanitized["error"] = redact_text(sanitized["error"])[:500]
-
-    if "reason" in sanitized:
-        sanitized["reason"] = redact_text(sanitized["reason"])
-
-    return sanitized
-
-
-def sanitize_paused_record(record: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "timestamp": record.get("timestamp"),
-        "ad_account_ref": short_hash(record.get("ad_account_id")),
-        "ad_ref": public_ad_ref(record.get("ad_id")),
-        "campaign_ref": public_campaign_ref(record.get("campaign_id")),
-        "rule": record.get("rule"),
-        "reason": record.get("reason"),
-        "paused": record.get("paused"),
-        "dry_run": record.get("dry_run", False),
-        "skip_reason": record.get("skip_reason"),
-        "meta_cli_result": sanitize_command_like_result(record.get("meta_cli_result") or {}),
-        "chatwork_notification": sanitize_chatwork_result(record.get("chatwork_notification") or {}),
+        "stderr_preview": redact_text(result.get("stderr") or "")[:300],
     }
 
 
@@ -208,7 +151,6 @@ def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
         "max_cpa",
         "action",
     }
-
     return {key: rule.get(key) for key in allowed_keys if key in rule}
 
 
@@ -242,11 +184,8 @@ def require_safe_config(config: dict[str, Any]) -> None:
     for rule in config.get("rules") or []:
         if rule.get("level") != "ad":
             raise ValueError(f"Unsupported rule level for {rule.get('name')}: only ad is allowed.")
-
         if rule.get("action") not in ALLOWED_ACTIONS:
-            raise ValueError(
-                f"Unsupported rule action for {rule.get('name')}: only pause_ad is allowed."
-            )
+            raise ValueError(f"Unsupported rule action for {rule.get('name')}: only pause_ad is allowed.")
 
 
 def resolve_ad_account_id(config: dict[str, Any]) -> str:
@@ -387,26 +326,6 @@ def allowed_graph_date_preset(window: str) -> str:
     return DATE_PRESET_FALLBACKS.get(window, window)
 
 
-def parse_json_output(stdout: str) -> list[dict[str, Any]]:
-    if not stdout:
-        return []
-
-    payload = json.loads(stdout)
-
-    if isinstance(payload, list):
-        return [row for row in payload if isinstance(row, dict)]
-
-    if isinstance(payload, dict):
-        for key in ("data", "results", "ads", "insights"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                return [row for row in value if isinstance(row, dict)]
-
-        return [payload]
-
-    raise ValueError("Meta Ads CLI output must be a JSON object or array.")
-
-
 def number(value: Any, default: float = 0.0) -> float:
     if value is None or value == "":
         return default
@@ -482,7 +401,6 @@ def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
         action_sources.extend(parse_action_list(ad.get(key)))
 
     from_actions = action_value(action_sources, conversion_event)
-
     if from_actions is not None:
         return from_actions
 
@@ -514,63 +432,38 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     }
 
 
-def evaluate_rule_with_diagnostic(
-    ad: dict[str, Any],
-    rule: dict[str, Any],
-) -> tuple[str | None, dict[str, Any]]:
+def evaluate_rule(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None, str, str]:
     spend = float(ad["spend"])
     conversions = float(ad["conversions"])
     cpa = ad["cpa"]
 
-    diagnostic = {
-        "rule": rule.get("name"),
-        "matched": False,
-        "decision": None,
-        "detail": None,
-        "thresholds": rule_public_summary(rule),
-    }
-
     if "spend_gt" in rule and spend <= float(rule["spend_gt"]):
-        diagnostic["decision"] = "spend_not_gt"
-        diagnostic["detail"] = f"spend={spend:g} threshold={float(rule['spend_gt']):g}"
-        return None, diagnostic
+        return None, "spend_not_gt", f"spend={spend:g} threshold={float(rule['spend_gt']):g}"
 
     if "min_spend" in rule and spend < float(rule["min_spend"]):
-        diagnostic["decision"] = "spend_below_min"
-        diagnostic["detail"] = f"spend={spend:g} threshold={float(rule['min_spend']):g}"
-        return None, diagnostic
+        return None, "spend_below_min", f"spend={spend:g} threshold={float(rule['min_spend']):g}"
 
     if "conversions_lt" in rule and conversions >= float(rule["conversions_lt"]):
-        diagnostic["decision"] = "conversions_not_lt"
-        diagnostic["detail"] = (
+        return None, "conversions_not_lt", (
             f"conversions={conversions:g} threshold={float(rule['conversions_lt']):g}"
         )
-        return None, diagnostic
 
     if "min_conversions" in rule and conversions < float(rule["min_conversions"]):
-        diagnostic["decision"] = "conversions_below_min"
-        diagnostic["detail"] = (
+        return None, "conversions_below_min", (
             f"conversions={conversions:g} threshold={float(rule['min_conversions']):g}"
         )
-        return None, diagnostic
 
     if "max_conversions" in rule and conversions > float(rule["max_conversions"]):
-        diagnostic["decision"] = "conversions_above_max"
-        diagnostic["detail"] = (
+        return None, "conversions_above_max", (
             f"conversions={conversions:g} threshold={float(rule['max_conversions']):g}"
         )
-        return None, diagnostic
 
     if "max_cpa" in rule:
         if cpa is None:
-            diagnostic["decision"] = "cpa_none"
-            diagnostic["detail"] = "cpa=None"
-            return None, diagnostic
+            return None, "cpa_none", "cpa=None"
 
         if cpa < float(rule["max_cpa"]):
-            diagnostic["decision"] = "cpa_below_threshold"
-            diagnostic["detail"] = f"cpa={cpa:g} threshold={float(rule['max_cpa']):g}"
-            return None, diagnostic
+            return None, "cpa_below_threshold", f"cpa={cpa:g} threshold={float(rule['max_cpa']):g}"
 
     reason_parts = [
         f"rule={rule.get('name')}",
@@ -581,30 +474,25 @@ def evaluate_rule_with_diagnostic(
     if cpa is not None:
         reason_parts.append(f"cpa={cpa:g}")
 
-    reason = ", ".join(reason_parts)
-
-    diagnostic["matched"] = True
-    diagnostic["decision"] = "matched"
-    diagnostic["detail"] = reason
-
-    return reason, diagnostic
+    return ", ".join(reason_parts), "matched", "matched"
 
 
-def find_matches_with_diagnostics(
+def find_matches(
     ads: list[dict[str, Any]],
     config: dict[str, Any],
-) -> tuple[list[Match], list[dict[str, Any]], dict[str, int]]:
+) -> tuple[list[Match], dict[str, Any], list[dict[str, Any]], dict[str, int]]:
     conversion_event = (config.get("meta") or {}).get("conversion_event", "")
     allowed_campaign_ids = set(allowed_campaign_ids_from_config_or_env(config))
 
     matches: list[Match] = []
-    diagnostics: list[dict[str, Any]] = []
     matched_ad_ids: set[str] = set()
+    matched_ads_summary: list[dict[str, Any]] = []
+    decision_counts: dict[str, int] = {}
 
-    summary = {
+    summary: dict[str, Any] = {
         "fetched": len(ads),
         "not_allowed_campaign": 0,
-        "already_paused": 0,
+        "already_paused_from_insights": 0,
         "missing_ad_id": 0,
         "evaluated": 0,
         "matched": 0,
@@ -613,54 +501,57 @@ def find_matches_with_diagnostics(
     for raw in ads:
         ad = normalize_ad(raw, conversion_event)
 
-        diagnostic = {
-            "ad_ref": public_ad_ref(ad.get("ad_id") or "missing"),
-            "campaign_ref": public_campaign_ref(ad.get("campaign_id") or "missing"),
-            "spend": ad.get("spend"),
-            "conversions": ad.get("conversions"),
-            "cpa": ad.get("cpa"),
-            "status": ad.get("status") or "",
-            "skipped": False,
-            "skip_reason": None,
-            "rule_evaluations": [],
-        }
-
         if ad["campaign_id"] not in allowed_campaign_ids:
             summary["not_allowed_campaign"] += 1
-            diagnostic["skipped"] = True
-            diagnostic["skip_reason"] = "campaign_not_allowed"
-            diagnostics.append(diagnostic)
+            decision_counts["campaign_not_allowed"] = decision_counts.get("campaign_not_allowed", 0) + 1
             continue
 
         if ad["status"] == PAUSED_STATUS:
-            summary["already_paused"] += 1
-            diagnostic["skipped"] = True
-            diagnostic["skip_reason"] = "already_paused"
-            diagnostics.append(diagnostic)
+            summary["already_paused_from_insights"] += 1
+            decision_counts["already_paused_from_insights"] = decision_counts.get("already_paused_from_insights", 0) + 1
             continue
 
         if not ad["ad_id"]:
             summary["missing_ad_id"] += 1
-            diagnostic["skipped"] = True
-            diagnostic["skip_reason"] = "missing_ad_id"
-            diagnostics.append(diagnostic)
+            decision_counts["missing_ad_id"] = decision_counts.get("missing_ad_id", 0) + 1
             continue
 
         summary["evaluated"] += 1
 
+        matched_this_ad = False
+        first_not_matched_decision = None
+
         for rule in config.get("rules") or []:
-            reason, rule_diagnostic = evaluate_rule_with_diagnostic(ad, rule)
-            diagnostic["rule_evaluations"].append(rule_diagnostic)
+            reason, decision, detail = evaluate_rule(ad, rule)
 
             if reason and ad["ad_id"] not in matched_ad_ids:
                 matches.append(Match(ad=ad, rule=rule, reason=reason))
                 matched_ad_ids.add(ad["ad_id"])
                 summary["matched"] += 1
+                decision_counts["matched"] = decision_counts.get("matched", 0) + 1
+                matched_this_ad = True
+
+                matched_ads_summary.append(
+                    {
+                        "ad_ref": public_ad_ref(ad["ad_id"]),
+                        "campaign_ref": public_campaign_ref(ad["campaign_id"]),
+                        "rule": rule.get("name"),
+                        "spend": ad["spend"],
+                        "conversions": ad["conversions"],
+                        "cpa": ad["cpa"],
+                        "selected_for_pause": False,
+                    }
+                )
                 break
 
-        diagnostics.append(diagnostic)
+            if first_not_matched_decision is None:
+                first_not_matched_decision = decision
 
-    return matches, diagnostics, summary
+        if not matched_this_ad:
+            decision = first_not_matched_decision or "not_matched"
+            decision_counts[decision] = decision_counts.get(decision, 0) + 1
+
+    return matches, summary, matched_ads_summary, decision_counts
 
 
 def insights_window(config: dict[str, Any]) -> str:
@@ -674,7 +565,7 @@ def insights_window(config: dict[str, Any]) -> str:
         return "24h"
 
     if len(windows) > 1:
-        raise ValueError("All initial rules must use the same window for one insights call.")
+        raise ValueError("All rules must use the same window for one insights call.")
 
     return next(iter(windows))
 
@@ -701,13 +592,7 @@ def fetch_insights(
     config: dict[str, Any],
     ad_account_id: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Fetch ad-level insights directly from Meta Graph API.
-
-    The Meta Ads CLI in this environment returned campaign-level aggregate rows,
-    even though the monitor needs ad_id. Therefore this function does not use
-    `meta ads insights get`; it calls the campaign insights edge with level=ad.
-    """
-    del ad_account_id  # Kept in the signature for compatibility with existing main().
+    del ad_account_id  # Kept for compatibility with main().
 
     meta_api = config.get("meta_api") or {}
     fields = meta_api.get("insights_fields") or (config.get("meta_cli") or {}).get(
@@ -718,7 +603,7 @@ def fetch_insights(
     window = allowed_graph_date_preset(insights_window(config))
 
     all_ads: list[dict[str, Any]] = []
-    results: list[dict[str, Any]] = []
+    fetch_summaries: list[dict[str, Any]] = []
 
     for campaign_id in allowed_campaign_ids_from_config_or_env(config):
         params = {
@@ -737,40 +622,17 @@ def fetch_insights(
         ensure_ad_level_insights(rows)
         all_ads.extend(rows)
 
-        results.append(
+        fetch_summaries.append(
             {
-                "command": [
-                    "meta-graph-api",
-                    f"/{public_campaign_ref(campaign_id)}/insights",
-                    "level=ad",
-                    f"date_preset={window}",
-                    f"fields={fields}",
-                ],
-                "returncode": 0,
-                "stdout": json.dumps(
-                    {
-                        "rows": len(rows),
-                        "pages": pages,
-                    },
-                    ensure_ascii=False,
-                ),
-                "stderr": "",
+                "campaign_ref": public_campaign_ref(campaign_id),
+                "rows": len(rows),
+                "pages": pages,
+                "level": "ad",
+                "date_preset": window,
             }
         )
 
-    return all_ads, results
-
-
-def fetch_ad_status(config: dict[str, Any], ad_id: str) -> str:
-    payload = graph_api_get_json(
-        config,
-        ad_id,
-        {
-            "fields": "effective_status,status",
-        },
-    )
-
-    return str(payload.get("effective_status") or payload.get("status") or "")
+    return all_ads, fetch_summaries
 
 
 def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
@@ -795,11 +657,10 @@ def build_chatwork_message(paused_record: dict[str, Any]) -> str:
     return "\n".join(
         [
             "[info][title]Meta ad paused[/title]",
-            f"Ad ref: {public_ad_ref(paused_record.get('ad_id'))}",
-            f"Campaign ref: {public_campaign_ref(paused_record.get('campaign_id'))}",
+            f"Ad ref: {paused_record.get('ad_ref')}",
+            f"Campaign ref: {paused_record.get('campaign_ref')}",
             f"Rule: {paused_record.get('rule') or '-'}",
             f"Reason: {paused_record.get('reason') or '-'}",
-            f"Ad account ref: {short_hash(paused_record.get('ad_account_id'))}",
             f"Run time (UTC): {paused_record.get('timestamp') or '-'}",
             "[/info]",
         ]
@@ -837,7 +698,7 @@ def notify_chatwork(message: str) -> dict[str, Any]:
                 "enabled": True,
                 "sent": 200 <= response.status < 300,
                 "status": response.status,
-                "response": body,
+                "response": "[REDACTED]",
             }
 
     except urllib.error.HTTPError as exc:
@@ -846,15 +707,39 @@ def notify_chatwork(message: str) -> dict[str, Any]:
             "enabled": True,
             "sent": False,
             "status": exc.code,
-            "error": body,
+            "error": redact_text(body)[:300],
         }
 
     except Exception as exc:
         return {
             "enabled": True,
             "sent": False,
-            "error": str(exc),
+            "error": redact_text(exc),
         }
+
+
+def make_pause_summary_record(
+    match: Match,
+    *,
+    paused: bool,
+    dry_run: bool = False,
+    skip_reason: str | None = None,
+    meta_cli_result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "ad_ref": public_ad_ref(match.ad["ad_id"]),
+        "campaign_ref": public_campaign_ref(match.ad["campaign_id"]),
+        "rule": match.rule.get("name"),
+        "spend": match.ad["spend"],
+        "conversions": match.ad["conversions"],
+        "cpa": match.ad["cpa"],
+        "paused": paused,
+        "dry_run": dry_run,
+        "skip_reason": skip_reason,
+        "meta_cli_result": sanitized_cli_summary(meta_cli_result or {}),
+        "error": error,
+    }
 
 
 def main() -> int:
@@ -867,20 +752,21 @@ def main() -> int:
 
     config_path = Path(args.config).resolve()
 
-    run_record: dict[str, Any] = {
+    output: dict[str, Any] = {
         "timestamp": utc_now_iso(),
-        "config": str(config_path),
         "mode": None,
-        "ad_account_ref": None,
         "fetch_source": "meta_graph_api",
-        "ads_fetched": 0,
+        "ad_account_ref": None,
         "rules": [],
+        "fetch": [],
         "evaluation_summary": {},
-        "evaluated_ads": [],
+        "decision_counts": {},
         "matched_ads": [],
         "paused_ads": [],
         "errors": [],
     }
+
+    exit_code = 0
 
     try:
         config = load_config(config_path)
@@ -891,99 +777,105 @@ def main() -> int:
         mode = config.get("mode", "dry_run")
         max_pauses = int((config.get("safety") or {}).get("max_pauses_per_run", 3))
 
-        run_record["mode"] = mode
-        run_record["ad_account_ref"] = short_hash(ad_account_id)
-        run_record["rules"] = [
-            rule_public_summary(rule)
-            for rule in (config.get("rules") or [])
-        ]
+        output["mode"] = mode
+        output["ad_account_ref"] = short_hash(ad_account_id)
+        output["rules"] = [rule_public_summary(rule) for rule in (config.get("rules") or [])]
 
-        ads, fetch_result = fetch_insights(config, ad_account_id)
-        matches, ad_diagnostics, evaluation_summary = find_matches_with_diagnostics(
-            ads,
-            config,
-        )
+        ads, fetch_summaries = fetch_insights(config, ad_account_id)
+        matches, evaluation_summary, matched_ads_summary, decision_counts = find_matches(ads, config)
+
         limited_matches = matches[:max_pauses]
+        selected_refs = {public_ad_ref(match.ad["ad_id"]) for match in limited_matches}
 
-        run_record["ads_fetched"] = len(ads)
-        run_record["meta_api_fetch"] = sanitize_command_like_results(fetch_result)
-        run_record["evaluation_summary"] = evaluation_summary
-        run_record["evaluated_ads"] = ad_diagnostics
-        run_record["matched_ads"] = [
-            sanitize_match(match, match in limited_matches)
-            for match in matches
-        ]
+        for item in matched_ads_summary:
+            item["selected_for_pause"] = item["ad_ref"] in selected_refs
+
+        output["fetch"] = fetch_summaries
+        output["evaluation_summary"] = {
+            **evaluation_summary,
+            "selected_for_pause": len(limited_matches),
+            "not_selected_due_to_max_pauses": max(0, len(matches) - len(limited_matches)),
+        }
+        output["decision_counts"] = decision_counts
+        output["matched_ads"] = matched_ads_summary
 
         if mode == "active":
             for match in limited_matches:
-                current_status = fetch_ad_status(config, match.ad["ad_id"])
-
-                if current_status == PAUSED_STATUS:
-                    already_paused_record = {
-                        "timestamp": utc_now_iso(),
-                        "ad_account_id": ad_account_id,
-                        "ad_id": match.ad["ad_id"],
-                        "campaign_id": match.ad["campaign_id"],
-                        "rule": match.rule.get("name"),
-                        "reason": match.reason,
-                        "paused": False,
-                        "skip_reason": "already_paused_before_pause_call",
-                    }
-                    run_record["paused_ads"].append(sanitize_paused_record(already_paused_record))
-                    continue
-
-                pause_result = pause_ad(config, match.ad["ad_id"])
-
-                paused_record = {
-                    "timestamp": utc_now_iso(),
-                    "ad_account_id": ad_account_id,
-                    "ad_id": match.ad["ad_id"],
-                    "ad_name": match.ad["ad_name"],
-                    "campaign_id": match.ad["campaign_id"],
-                    "rule": match.rule.get("name"),
-                    "reason": match.reason,
-                    "paused": True,
-                    "meta_cli_result": pause_result,
-                }
-
-                chatwork_result = notify_chatwork(build_chatwork_message(paused_record))
-                paused_record["chatwork_notification"] = chatwork_result
-
-                if chatwork_result.get("enabled") and not chatwork_result.get("sent"):
-                    run_record["errors"].append(
-                        f"Chatwork notification failed for {public_ad_ref(match.ad['ad_id'])}: "
-                        f"{redact_text(chatwork_result.get('error') or chatwork_result.get('status'))}"
+                try:
+                    pause_result = pause_ad(config, match.ad["ad_id"])
+                    record = make_pause_summary_record(
+                        match,
+                        paused=True,
+                        meta_cli_result=pause_result,
                     )
+                    output["paused_ads"].append(record)
 
-                sanitized_paused_record = sanitize_paused_record(paused_record)
-                run_record["paused_ads"].append(sanitized_paused_record)
-                append_jsonl(PAUSED_LOG, sanitized_paused_record)
+                    chatwork_record = {
+                        "timestamp": utc_now_iso(),
+                        "ad_ref": record["ad_ref"],
+                        "campaign_ref": record["campaign_ref"],
+                        "rule": record["rule"],
+                        "reason": match.reason,
+                    }
+                    chatwork_result = notify_chatwork(build_chatwork_message(chatwork_record))
+                    record["chatwork"] = {
+                        "enabled": chatwork_result.get("enabled", False),
+                        "sent": chatwork_result.get("sent", False),
+                        "status": chatwork_result.get("status"),
+                        "error": chatwork_result.get("error"),
+                    }
+
+                    if chatwork_result.get("enabled") and not chatwork_result.get("sent"):
+                        output["errors"].append(
+                            f"Chatwork notification failed for {record['ad_ref']}: "
+                            f"{redact_text(chatwork_result.get('error') or chatwork_result.get('status'))}"
+                        )
+
+                except Exception as exc:
+                    exit_code = 1
+                    output["paused_ads"].append(
+                        make_pause_summary_record(
+                            match,
+                            paused=False,
+                            error=redact_text(exc),
+                        )
+                    )
+                    output["errors"].append(f"Pause failed for {public_ad_ref(match.ad['ad_id'])}: {redact_text(exc)}")
 
         else:
             for match in limited_matches:
-                run_record["paused_ads"].append(
-                    sanitize_paused_record(
-                        {
-                            "timestamp": utc_now_iso(),
-                            "ad_account_id": ad_account_id,
-                            "ad_id": match.ad["ad_id"],
-                            "campaign_id": match.ad["campaign_id"],
-                            "rule": match.rule.get("name"),
-                            "reason": match.reason,
-                            "paused": False,
-                            "dry_run": True,
-                        }
+                output["paused_ads"].append(
+                    make_pause_summary_record(
+                        match,
+                        paused=False,
+                        dry_run=True,
+                        skip_reason="dry_run",
                     )
                 )
 
-        append_jsonl(RUNS_LOG, run_record)
-        print(json.dumps(run_record, ensure_ascii=False, indent=2))
-        return 0
+        output["pause_summary"] = {
+            "matched": len(matches),
+            "selected_for_pause": len(limited_matches),
+            "pause_attempted": len(output["paused_ads"]),
+            "paused": sum(1 for item in output["paused_ads"] if item.get("paused") is True),
+            "not_paused": sum(1 for item in output["paused_ads"] if item.get("paused") is not True),
+            "errors": len(output["errors"]),
+        }
+
+        print(json.dumps(output, ensure_ascii=False, indent=2))
+        return exit_code
 
     except Exception as exc:
-        run_record["errors"].append(redact_text(exc))
-        append_jsonl(RUNS_LOG, run_record)
-        print(json.dumps(run_record, ensure_ascii=False, indent=2), file=sys.stderr)
+        output["errors"].append(redact_text(exc))
+        output["pause_summary"] = {
+            "matched": 0,
+            "selected_for_pause": 0,
+            "pause_attempted": 0,
+            "paused": 0,
+            "not_paused": 0,
+            "errors": len(output["errors"]),
+        }
+        print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
 
 
