@@ -5,7 +5,6 @@ import argparse
 import ast
 import json
 import os
-import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -25,7 +24,9 @@ ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
-DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,date_start,date_stop"
+DEFAULT_INSIGHTS_FIELDS = (
+    "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,date_start,date_stop"
+)
 
 DATE_PRESET_FALLBACKS = {
     "maximum": "last_90d",
@@ -58,17 +59,6 @@ def load_dotenv(path: Path) -> None:
         key = key.strip()
         value = value.strip().strip('"').strip("'")
         os.environ.setdefault(key, value)
-
-
-def sync_meta_cli_env() -> None:
-    meta_token = os.getenv("META_ACCESS_TOKEN")
-    meta_account_id = os.getenv("META_AD_ACCOUNT_ID")
-
-    if meta_token:
-        os.environ.setdefault("ACCESS_TOKEN", meta_token)
-
-    if meta_account_id:
-        os.environ.setdefault("AD_ACCOUNT_ID", meta_account_id.removeprefix("act_"))
 
 
 def load_config(path: Path) -> dict[str, Any]:
@@ -131,13 +121,6 @@ def redact_text(value: Any) -> str:
     return text
 
 
-def sanitized_cli_summary(result: dict[str, Any]) -> dict[str, Any]:
-    return {
-        "returncode": result.get("returncode"),
-        "stderr_preview": redact_text(result.get("stderr") or "")[:300],
-    }
-
-
 def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
     allowed_keys = {
         "name",
@@ -152,6 +135,24 @@ def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
         "action",
     }
     return {key: rule.get(key) for key in allowed_keys if key in rule}
+
+
+def allowed_campaign_ids_from_config_or_env(config: dict[str, Any]) -> list[str]:
+    env_value = os.getenv("META_ALLOWED_CAMPAIGN_IDS", "")
+
+    if env_value.strip():
+        normalized = env_value.replace("\n", ",")
+        return [
+            item.strip().strip('"').strip("'")
+            for item in normalized.split(",")
+            if item.strip()
+        ]
+
+    return [
+        str(cid)
+        for cid in ((config.get("target") or {}).get("allowed_campaign_ids") or [])
+        if str(cid) and not str(cid).startswith("SET_")
+    ]
 
 
 def require_safe_config(config: dict[str, Any]) -> None:
@@ -197,31 +198,13 @@ def resolve_ad_account_id(config: dict[str, Any]) -> str:
     return account_id
 
 
-def allowed_campaign_ids_from_config_or_env(config: dict[str, Any]) -> list[str]:
-    env_value = os.getenv("META_ALLOWED_CAMPAIGN_IDS", "")
-
-    if env_value.strip():
-        normalized = env_value.replace("\n", ",")
-        return [
-            item.strip().strip('"').strip("'")
-            for item in normalized.split(",")
-            if item.strip()
-        ]
-
-    return [
-        str(cid)
-        for cid in ((config.get("target") or {}).get("allowed_campaign_ids") or [])
-        if str(cid) and not str(cid).startswith("SET_")
-    ]
-
-
 def require_token() -> None:
     if not os.getenv("META_ACCESS_TOKEN"):
         raise ValueError("META_ACCESS_TOKEN must be set in the environment or .env.")
 
 
 def meta_access_token() -> str:
-    token = os.getenv("META_ACCESS_TOKEN") or os.getenv("ACCESS_TOKEN")
+    token = os.getenv("META_ACCESS_TOKEN")
     if not token:
         raise ValueError("META_ACCESS_TOKEN must be set.")
     return token
@@ -235,46 +218,33 @@ def graph_api_version(config: dict[str, Any]) -> str:
     )
 
 
-def format_args(args: list[str], values: dict[str, Any]) -> list[str]:
-    return [str(arg).format(**values) for arg in args]
-
-
-def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
-    command = [executable, *args]
-
-    completed = subprocess.run(
-        command,
-        check=False,
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-    )
-
-    return {
-        "command": command,
-        "returncode": completed.returncode,
-        "stdout": completed.stdout.strip(),
-        "stderr": completed.stderr.strip(),
-    }
-
-
-def graph_api_get_json(
+def graph_api_request_json(
     config: dict[str, Any],
+    method: str,
     path: str,
     params: dict[str, Any] | None = None,
     *,
     absolute_url: str | None = None,
 ) -> dict[str, Any]:
+    method = method.upper()
+
     if absolute_url:
         url = absolute_url
+        data = None
     else:
         version = graph_api_version(config)
         base_url = f"https://graph.facebook.com/{version}/{path.lstrip('/')}"
-        query_params = dict(params or {})
-        query_params["access_token"] = meta_access_token()
-        url = f"{base_url}?{urllib.parse.urlencode(query_params)}"
+        request_params = dict(params or {})
+        request_params["access_token"] = meta_access_token()
 
-    request = urllib.request.Request(url, method="GET")
+        if method == "GET":
+            url = f"{base_url}?{urllib.parse.urlencode(request_params)}"
+            data = None
+        else:
+            url = base_url
+            data = urllib.parse.urlencode(request_params).encode("utf-8")
+
+    request = urllib.request.Request(url, data=data, method=method)
 
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
@@ -287,11 +257,12 @@ def graph_api_get_json(
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"Meta Graph API request failed: status={exc.code}, body={redact_text(body)[:1000]}"
+            f"Meta Graph API request failed: method={method}, status={exc.code}, "
+            f"body={redact_text(body)[:1000]}"
         ) from exc
 
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Meta Graph API request failed: {redact_text(exc)}") from exc
+        raise RuntimeError(f"Meta Graph API request failed: method={method}, error={redact_text(exc)}") from exc
 
 
 def graph_api_get_paginated_data(
@@ -302,7 +273,7 @@ def graph_api_get_paginated_data(
     rows: list[dict[str, Any]] = []
     pages = 0
 
-    payload = graph_api_get_json(config, path, params)
+    payload = graph_api_request_json(config, "GET", path, params)
     pages += 1
 
     while True:
@@ -316,7 +287,7 @@ def graph_api_get_paginated_data(
         if not next_url:
             break
 
-        payload = graph_api_get_json(config, "", absolute_url=next_url)
+        payload = graph_api_request_json(config, "GET", "", absolute_url=next_url)
         pages += 1
 
     return rows, pages
@@ -432,38 +403,31 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     }
 
 
-def evaluate_rule(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None, str, str]:
+def evaluate_rule(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None, str]:
     spend = float(ad["spend"])
     conversions = float(ad["conversions"])
     cpa = ad["cpa"]
 
     if "spend_gt" in rule and spend <= float(rule["spend_gt"]):
-        return None, "spend_not_gt", f"spend={spend:g} threshold={float(rule['spend_gt']):g}"
+        return None, "spend_not_gt"
 
     if "min_spend" in rule and spend < float(rule["min_spend"]):
-        return None, "spend_below_min", f"spend={spend:g} threshold={float(rule['min_spend']):g}"
+        return None, "spend_below_min"
 
     if "conversions_lt" in rule and conversions >= float(rule["conversions_lt"]):
-        return None, "conversions_not_lt", (
-            f"conversions={conversions:g} threshold={float(rule['conversions_lt']):g}"
-        )
+        return None, "conversions_not_lt"
 
     if "min_conversions" in rule and conversions < float(rule["min_conversions"]):
-        return None, "conversions_below_min", (
-            f"conversions={conversions:g} threshold={float(rule['min_conversions']):g}"
-        )
+        return None, "conversions_below_min"
 
     if "max_conversions" in rule and conversions > float(rule["max_conversions"]):
-        return None, "conversions_above_max", (
-            f"conversions={conversions:g} threshold={float(rule['max_conversions']):g}"
-        )
+        return None, "conversions_above_max"
 
     if "max_cpa" in rule:
         if cpa is None:
-            return None, "cpa_none", "cpa=None"
-
+            return None, "cpa_none"
         if cpa < float(rule["max_cpa"]):
-            return None, "cpa_below_threshold", f"cpa={cpa:g} threshold={float(rule['max_cpa']):g}"
+            return None, "cpa_below_threshold"
 
     reason_parts = [
         f"rule={rule.get('name')}",
@@ -474,7 +438,7 @@ def evaluate_rule(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None,
     if cpa is not None:
         reason_parts.append(f"cpa={cpa:g}")
 
-    return ", ".join(reason_parts), "matched", "matched"
+    return ", ".join(reason_parts), "matched"
 
 
 def find_matches(
@@ -522,7 +486,7 @@ def find_matches(
         first_not_matched_decision = None
 
         for rule in config.get("rules") or []:
-            reason, decision, detail = evaluate_rule(ad, rule)
+            reason, decision = evaluate_rule(ad, rule)
 
             if reason and ad["ad_id"] not in matched_ad_ids:
                 matches.append(Match(ad=ad, rule=rule, reason=reason))
@@ -592,14 +556,10 @@ def fetch_insights(
     config: dict[str, Any],
     ad_account_id: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    del ad_account_id  # Kept for compatibility with main().
+    del ad_account_id  # Kept for output consistency.
 
     meta_api = config.get("meta_api") or {}
-    fields = meta_api.get("insights_fields") or (config.get("meta_cli") or {}).get(
-        "insights_fields",
-        DEFAULT_INSIGHTS_FIELDS,
-    )
-
+    fields = meta_api.get("insights_fields") or DEFAULT_INSIGHTS_FIELDS
     window = allowed_graph_date_preset(insights_window(config))
 
     all_ads: list[dict[str, Any]] = []
@@ -636,21 +596,25 @@ def fetch_insights(
 
 
 def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
-    cli = config.get("meta_cli") or {}
-    executable = cli.get("executable", "meta")
+    payload = graph_api_request_json(
+        config,
+        "POST",
+        ad_id,
+        {
+            "status": PAUSED_STATUS,
+        },
+    )
 
-    args_template = cli.get("pause_args") or []
-    args = format_args(args_template, {"ad_id": ad_id, "status": PAUSED_STATUS})
-
-    result = run_cli(executable, args)
-
-    if result["returncode"] != 0:
+    if payload.get("success") is not True:
         raise RuntimeError(
-            f"Meta Ads CLI pause command failed for {public_ad_ref(ad_id)}: "
-            f"{redact_text(result['stderr'] or result['stdout'])}"
+            f"Meta Graph API pause returned unexpected response for {public_ad_ref(ad_id)}: "
+            f"{redact_text(payload)}"
         )
 
-    return result
+    return {
+        "success": True,
+        "raw": {"success": True},
+    }
 
 
 def build_chatwork_message(paused_record: dict[str, Any]) -> str:
@@ -693,12 +657,11 @@ def notify_chatwork(message: str) -> dict[str, Any]:
 
     try:
         with urllib.request.urlopen(request, timeout=20) as response:
-            body = response.read().decode("utf-8", errors="replace")
+            response.read()
             return {
                 "enabled": True,
                 "sent": 200 <= response.status < 300,
                 "status": response.status,
-                "response": "[REDACTED]",
             }
 
     except urllib.error.HTTPError as exc:
@@ -724,7 +687,7 @@ def make_pause_summary_record(
     paused: bool,
     dry_run: bool = False,
     skip_reason: str | None = None,
-    meta_cli_result: dict[str, Any] | None = None,
+    api_result: dict[str, Any] | None = None,
     error: str | None = None,
 ) -> dict[str, Any]:
     return {
@@ -737,7 +700,7 @@ def make_pause_summary_record(
         "paused": paused,
         "dry_run": dry_run,
         "skip_reason": skip_reason,
-        "meta_cli_result": sanitized_cli_summary(meta_cli_result or {}),
+        "api_result": api_result or {},
         "error": error,
     }
 
@@ -748,14 +711,15 @@ def main() -> int:
     args = parser.parse_args()
 
     load_dotenv(PROJECT_ROOT / ".env")
-    sync_meta_cli_env()
 
     config_path = Path(args.config).resolve()
 
     output: dict[str, Any] = {
         "timestamp": utc_now_iso(),
         "mode": None,
+        "api_only": True,
         "fetch_source": "meta_graph_api",
+        "pause_source": "meta_graph_api",
         "ad_account_ref": None,
         "rules": [],
         "fetch": [],
@@ -802,11 +766,11 @@ def main() -> int:
         if mode == "active":
             for match in limited_matches:
                 try:
-                    pause_result = pause_ad(config, match.ad["ad_id"])
+                    api_result = pause_ad(config, match.ad["ad_id"])
                     record = make_pause_summary_record(
                         match,
                         paused=True,
-                        meta_cli_result=pause_result,
+                        api_result=api_result,
                     )
                     output["paused_ads"].append(record)
 
@@ -840,7 +804,9 @@ def main() -> int:
                             error=redact_text(exc),
                         )
                     )
-                    output["errors"].append(f"Pause failed for {public_ad_ref(match.ad['ad_id'])}: {redact_text(exc)}")
+                    output["errors"].append(
+                        f"Pause failed for {public_ad_ref(match.ad['ad_id'])}: {redact_text(exc)}"
+                    )
 
         else:
             for match in limited_matches:
