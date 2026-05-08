@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   schedule:
     - cron: "7,37 * * * *"
-    
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
@@ -35,11 +35,9 @@ jobs:
           value = os.environ.get("META_GUARD_ENV", "")
           if not value.strip():
               raise SystemExit("META_GUARD_ENV secret is not set.")
+
           Path(".env").write_text(value, encoding="utf-8")
           PY
-
-      - name: Check Meta Ads CLI
-        run: meta ads --help
 
       - name: Run guard
         run: python scripts/monitor_meta_ads.py --config config/rules.yml
