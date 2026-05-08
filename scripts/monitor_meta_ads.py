@@ -22,6 +22,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
+ACTIVE_STATUS = "ACTIVE"
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
 DEFAULT_INSIGHTS_FIELDS = (
@@ -385,21 +386,101 @@ def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
     return 0.0
 
 
+
+def fetch_ad_state(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
+    payload = graph_api_request_json(
+        config,
+        "GET",
+        ad_id,
+        {
+            "fields": "id,name,status,effective_status",
+        },
+    )
+
+    return {
+        "id": str(payload.get("id") or ad_id),
+        "name": str(payload.get("name") or ""),
+        "configured_status": str(payload.get("status") or ""),
+        "effective_status": str(payload.get("effective_status") or ""),
+    }
+
+
+def enrich_ads_with_current_state(
+    config: dict[str, Any],
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, int]]:
+    """Add current ad status before rule evaluation.
+
+    Insights can include spend/CV for ads that are already manually turned off.
+    Those ads must not be matched, paused again, or notified.
+    """
+    state_cache: dict[str, dict[str, Any]] = {}
+    enriched_rows: list[dict[str, Any]] = []
+    summary = {
+        "state_checked": 0,
+        "active": 0,
+        "not_active": 0,
+        "state_check_failed": 0,
+    }
+
+    for row in rows:
+        ad_id = str(row.get("ad_id") or row.get("id") or "")
+        enriched = dict(row)
+
+        if not ad_id:
+            enriched_rows.append(enriched)
+            continue
+
+        try:
+            if ad_id not in state_cache:
+                state_cache[ad_id] = fetch_ad_state(config, ad_id)
+                summary["state_checked"] += 1
+
+            state = state_cache[ad_id]
+            configured_status = state.get("configured_status") or ""
+            effective_status = state.get("effective_status") or ""
+            ad_name = state.get("name") or enriched.get("ad_name") or enriched.get("name") or ""
+
+            enriched["_current_ad_id"] = ad_id
+            enriched["_current_ad_name"] = ad_name
+            enriched["_configured_status"] = configured_status
+            enriched["_effective_status"] = effective_status
+
+            if configured_status == ACTIVE_STATUS and effective_status == ACTIVE_STATUS:
+                summary["active"] += 1
+            else:
+                summary["not_active"] += 1
+
+        except Exception as exc:
+            enriched["_state_check_error"] = redact_text(exc)
+            summary["state_check_failed"] += 1
+
+        enriched_rows.append(enriched)
+
+    return enriched_rows, summary
+
+
 def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     spend = number(raw.get("spend"))
     conversions = conversions_from_ad(raw, conversion_event)
     cpa = spend / conversions if conversions > 0 else None
 
+    configured_status = str(raw.get("_configured_status") or raw.get("configured_status") or raw.get("status") or "")
+    effective_status = str(raw.get("_effective_status") or raw.get("effective_status") or configured_status or "")
+
     return {
         **raw,
-        "ad_id": str(raw.get("ad_id") or raw.get("id") or ""),
-        "ad_name": raw.get("ad_name") or raw.get("name") or "",
+        "ad_id": str(raw.get("ad_id") or raw.get("id") or raw.get("_current_ad_id") or ""),
+        "ad_name": raw.get("_current_ad_name") or raw.get("ad_name") or raw.get("name") or "",
         "campaign_id": str(raw.get("campaign_id") or ""),
         "campaign_name": raw.get("campaign_name") or "",
         "spend": spend,
         "conversions": conversions,
         "cpa": cpa,
-        "status": raw.get("status") or raw.get("effective_status") or "",
+        "configured_status": configured_status,
+        "effective_status": effective_status,
+        "state_check_error": raw.get("_state_check_error"),
+        "is_active": configured_status == ACTIVE_STATUS and effective_status == ACTIVE_STATUS,
     }
 
 
@@ -456,7 +537,8 @@ def find_matches(
     summary: dict[str, Any] = {
         "fetched": len(ads),
         "not_allowed_campaign": 0,
-        "already_paused_from_insights": 0,
+        "not_active_before_evaluation": 0,
+        "state_check_failed": 0,
         "missing_ad_id": 0,
         "evaluated": 0,
         "matched": 0,
@@ -470,14 +552,22 @@ def find_matches(
             decision_counts["campaign_not_allowed"] = decision_counts.get("campaign_not_allowed", 0) + 1
             continue
 
-        if ad["status"] == PAUSED_STATUS:
-            summary["already_paused_from_insights"] += 1
-            decision_counts["already_paused_from_insights"] = decision_counts.get("already_paused_from_insights", 0) + 1
-            continue
-
         if not ad["ad_id"]:
             summary["missing_ad_id"] += 1
             decision_counts["missing_ad_id"] = decision_counts.get("missing_ad_id", 0) + 1
+            continue
+
+        if ad.get("state_check_error"):
+            summary["state_check_failed"] += 1
+            decision_counts["state_check_failed"] = decision_counts.get("state_check_failed", 0) + 1
+            continue
+
+        # Do not evaluate or pause ads that are already off.
+        # This prevents manually-off ads from being matched and notified again.
+        if not ad["is_active"]:
+            summary["not_active_before_evaluation"] += 1
+            status_key = ad["effective_status"] or ad["configured_status"] or "unknown"
+            decision_counts[f"not_active:{status_key}"] = decision_counts.get(f"not_active:{status_key}", 0) + 1
             continue
 
         summary["evaluated"] += 1
@@ -503,6 +593,8 @@ def find_matches(
                         "spend": ad["spend"],
                         "conversions": ad["conversions"],
                         "cpa": ad["cpa"],
+                        "configured_status": ad["configured_status"],
+                        "effective_status": ad["effective_status"],
                         "selected_for_pause": False,
                     }
                 )
@@ -580,6 +672,7 @@ def fetch_insights(
         )
 
         ensure_ad_level_insights(rows)
+        rows, state_summary = enrich_ads_with_current_state(config, rows)
         all_ads.extend(rows)
 
         fetch_summaries.append(
@@ -589,6 +682,7 @@ def fetch_insights(
                 "pages": pages,
                 "level": "ad",
                 "date_preset": window,
+                "state_summary": state_summary,
             }
         )
 
@@ -620,13 +714,10 @@ def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
 def build_chatwork_message(paused_record: dict[str, Any]) -> str:
     return "\n".join(
         [
-            "[info][title]Meta ad paused[/title]",
-            f"Ad ref: {paused_record.get('ad_ref')}",
-            f"Campaign ref: {paused_record.get('campaign_ref')}",
-            f"Rule: {paused_record.get('rule') or '-'}",
-            f"Reason: {paused_record.get('reason') or '-'}",
+            "以下を停止しました。",
+            f"広告名: {paused_record.get('ad_name') or '-'}",
+            f"広告ID: {paused_record.get('ad_id') or '-'}",
             f"Run time (UTC): {paused_record.get('timestamp') or '-'}",
-            "[/info]",
         ]
     )
 
@@ -697,6 +788,8 @@ def make_pause_summary_record(
         "spend": match.ad["spend"],
         "conversions": match.ad["conversions"],
         "cpa": match.ad["cpa"],
+        "configured_status": match.ad.get("configured_status"),
+        "effective_status": match.ad.get("effective_status"),
         "paused": paused,
         "dry_run": dry_run,
         "skip_reason": skip_reason,
@@ -776,10 +869,8 @@ def main() -> int:
 
                     chatwork_record = {
                         "timestamp": utc_now_iso(),
-                        "ad_ref": record["ad_ref"],
-                        "campaign_ref": record["campaign_ref"],
-                        "rule": record["rule"],
-                        "reason": match.reason,
+                        "ad_name": match.ad.get("ad_name"),
+                        "ad_id": match.ad.get("ad_id"),
                     }
                     chatwork_result = notify_chatwork(build_chatwork_message(chatwork_record))
                     record["chatwork"] = {
