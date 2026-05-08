@@ -27,7 +27,7 @@ ALLOWED_MODES = {"dry_run", "active"}
 ALLOWED_ACTIONS = {"pause_ad"}
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
-DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions"
+DEFAULT_INSIGHTS_FIELDS = "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,date_start,date_stop"
 
 DATE_PRESET_FALLBACKS = {
     "maximum": "last_90d",
@@ -131,7 +131,7 @@ def redact_text(value: Any) -> str:
     return text
 
 
-def sanitize_cli_result(result: dict[str, Any]) -> dict[str, Any]:
+def sanitize_command_like_result(result: dict[str, Any]) -> dict[str, Any]:
     command = result.get("command") or []
 
     return {
@@ -142,8 +142,8 @@ def sanitize_cli_result(result: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def sanitize_cli_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [sanitize_cli_result(result) for result in results]
+def sanitize_command_like_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [sanitize_command_like_result(result) for result in results]
 
 
 def public_ad_ref(ad_id: Any) -> str:
@@ -189,7 +189,8 @@ def sanitize_paused_record(record: dict[str, Any]) -> dict[str, Any]:
         "reason": record.get("reason"),
         "paused": record.get("paused"),
         "dry_run": record.get("dry_run", False),
-        "meta_cli_result": sanitize_cli_result(record.get("meta_cli_result") or {}),
+        "skip_reason": record.get("skip_reason"),
+        "meta_cli_result": sanitize_command_like_result(record.get("meta_cli_result") or {}),
         "chatwork_notification": sanitize_chatwork_result(record.get("chatwork_notification") or {}),
     }
 
@@ -280,6 +281,21 @@ def require_token() -> None:
         raise ValueError("META_ACCESS_TOKEN must be set in the environment or .env.")
 
 
+def meta_access_token() -> str:
+    token = os.getenv("META_ACCESS_TOKEN") or os.getenv("ACCESS_TOKEN")
+    if not token:
+        raise ValueError("META_ACCESS_TOKEN must be set.")
+    return token
+
+
+def graph_api_version(config: dict[str, Any]) -> str:
+    return (
+        os.getenv("META_GRAPH_API_VERSION")
+        or (config.get("meta_api") or {}).get("version")
+        or "v25.0"
+    )
+
+
 def format_args(args: list[str], values: dict[str, Any]) -> list[str]:
     return [str(arg).format(**values) for arg in args]
 
@@ -303,58 +319,72 @@ def run_cli(executable: str, args: list[str]) -> dict[str, Any]:
     }
 
 
-def cli_help(executable: str, args: list[str]) -> str:
-    result = run_cli(executable, [*args, "-h"])
-    text = "\n".join(part for part in (result.get("stdout"), result.get("stderr")) if part)
+def graph_api_get_json(
+    config: dict[str, Any],
+    path: str,
+    params: dict[str, Any] | None = None,
+    *,
+    absolute_url: str | None = None,
+) -> dict[str, Any]:
+    if absolute_url:
+        url = absolute_url
+    else:
+        version = graph_api_version(config)
+        base_url = f"https://graph.facebook.com/{version}/{path.lstrip('/')}"
+        query_params = dict(params or {})
+        query_params["access_token"] = meta_access_token()
+        url = f"{base_url}?{urllib.parse.urlencode(query_params)}"
 
-    if result["returncode"] != 0 or not text:
+    request = urllib.request.Request(url, method="GET")
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8", errors="replace")
+            payload = json.loads(body)
+            if not isinstance(payload, dict):
+                raise RuntimeError("Meta Graph API returned non-object JSON.")
+            return payload
+
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(
-            f"Could not read Meta Ads CLI help for {' '.join(args)}: {redact_text(text)}"
-        )
+            f"Meta Graph API request failed: status={exc.code}, body={redact_text(body)[:1000]}"
+        ) from exc
 
-    return text
-
-
-def choose_option(help_text: str, options: list[str], required: bool = True) -> str | None:
-    for option in options:
-        if option in help_text:
-            return option
-
-    if required:
-        raise RuntimeError(
-            f"Meta Ads CLI help did not include any supported option: {', '.join(options)}"
-        )
-
-    return None
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Meta Graph API request failed: {redact_text(exc)}") from exc
 
 
-def allowed_date_presets(help_text: str) -> set[str]:
-    presets = {
-        "today",
-        "yesterday",
-        "last_3d",
-        "last_7d",
-        "last_14d",
-        "last_30d",
-        "last_90d",
-        "this_month",
-        "last_month",
-    }
+def graph_api_get_paginated_data(
+    config: dict[str, Any],
+    path: str,
+    params: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    rows: list[dict[str, Any]] = []
+    pages = 0
 
-    return {preset for preset in presets if preset in help_text} or presets
+    payload = graph_api_get_json(config, path, params)
+    pages += 1
+
+    while True:
+        data = payload.get("data") or []
+        if not isinstance(data, list):
+            raise RuntimeError("Meta Graph API data field was not a list.")
+
+        rows.extend([row for row in data if isinstance(row, dict)])
+
+        next_url = (payload.get("paging") or {}).get("next")
+        if not next_url:
+            break
+
+        payload = graph_api_get_json(config, "", absolute_url=next_url)
+        pages += 1
+
+    return rows, pages
 
 
-def normalize_date_preset(window: str, help_text: str) -> str:
-    preset = DATE_PRESET_FALLBACKS.get(window, window)
-    allowed = allowed_date_presets(help_text)
-
-    if preset in allowed:
-        return preset
-
-    if "last_90d" in allowed:
-        return "last_90d"
-
-    raise RuntimeError(f"Unsupported date preset for Meta Ads CLI: {redact_text(window)}")
+def allowed_graph_date_preset(window: str) -> str:
+    return DATE_PRESET_FALLBACKS.get(window, window)
 
 
 def parse_json_output(stdout: str) -> list[dict[str, Any]]:
@@ -456,9 +486,12 @@ def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
     if from_actions is not None:
         return from_actions
 
-    for key in ("conversions", "conversion_count", "cv"):
+    for key in ("conversion_count", "cv"):
         if key in ad:
             return number(ad.get(key))
+
+    if "conversions" in ad and not isinstance(ad.get("conversions"), (list, dict)):
+        return number(ad.get("conversions"))
 
     return 0.0
 
@@ -641,66 +674,12 @@ def insights_window(config: dict[str, Any]) -> str:
         return "24h"
 
     if len(windows) > 1:
-        raise ValueError("All initial rules must use the same window for one CLI insights call.")
+        raise ValueError("All initial rules must use the same window for one insights call.")
 
     return next(iter(windows))
 
 
-def build_insights_args(
-    config: dict[str, Any],
-    executable: str,
-    ad_account_id: str,
-    campaign_id: str,
-) -> list[str]:
-    help_text = cli_help(executable, ["ads", "insights", "get"])
-
-    campaign_option = choose_option(help_text, ["--campaign-id", "--campaign_id"])
-    date_option = choose_option(help_text, ["--date-preset", "--date_preset"])
-    fields_option = choose_option(help_text, ["--fields"])
-    output_option = choose_option(help_text, ["--output", "--format"], required=False)
-
-    # Important:
-    # Without level=ad, some Meta CLI versions return campaign-level insights.
-    # Campaign-level rows do not contain ad_id, so ad pause cannot work.
-    level_option = choose_option(help_text, ["--level"], required=False)
-
-    fields = (config.get("meta_cli") or {}).get("insights_fields", DEFAULT_INSIGHTS_FIELDS)
-
-    args = [
-        "ads",
-        "--ad-account-id",
-        ad_account_id,
-        "insights",
-        "get",
-        campaign_option,
-        campaign_id,
-        date_option,
-        normalize_date_preset(insights_window(config), help_text),
-    ]
-
-    if level_option:
-        args.extend([level_option, "ad"])
-
-    args.extend(
-        [
-            fields_option,
-            fields,
-        ]
-    )
-
-    if output_option:
-        args.extend([output_option, "json"])
-
-    return args
-
-
 def ensure_ad_level_insights(rows: list[dict[str, Any]]) -> None:
-    """Fail loudly when insights are not ad-level rows.
-
-    This monitor pauses ads. Therefore, actionable rows must contain ad_id or id.
-    If Meta CLI returns campaign-level aggregate rows, continuing silently is dangerous:
-    the script looks healthy but cannot pause anything.
-    """
     if not rows:
         return
 
@@ -711,9 +690,9 @@ def ensure_ad_level_insights(rows: list[dict[str, Any]]) -> None:
         safe_keys = sorted(str(key) for key in sample.keys())
 
         raise RuntimeError(
-            "Meta Ads CLI insights did not return ad-level rows. "
+            "Meta Graph API insights did not return ad-level rows. "
             "No ad_id was present, so ads cannot be paused. "
-            "Use insights with '--level ad', or use a CLI/API method that returns ad_id. "
+            "The fetch must use level=ad. "
             f"Returned keys: {safe_keys}"
         )
 
@@ -722,27 +701,76 @@ def fetch_insights(
     config: dict[str, Any],
     ad_account_id: str,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    cli = config.get("meta_cli") or {}
-    executable = cli.get("executable", "meta")
+    """Fetch ad-level insights directly from Meta Graph API.
+
+    The Meta Ads CLI in this environment returned campaign-level aggregate rows,
+    even though the monitor needs ad_id. Therefore this function does not use
+    `meta ads insights get`; it calls the campaign insights edge with level=ad.
+    """
+    del ad_account_id  # Kept in the signature for compatibility with existing main().
+
+    meta_api = config.get("meta_api") or {}
+    fields = meta_api.get("insights_fields") or (config.get("meta_cli") or {}).get(
+        "insights_fields",
+        DEFAULT_INSIGHTS_FIELDS,
+    )
+
+    window = allowed_graph_date_preset(insights_window(config))
 
     all_ads: list[dict[str, Any]] = []
     results: list[dict[str, Any]] = []
 
     for campaign_id in allowed_campaign_ids_from_config_or_env(config):
-        args = build_insights_args(config, executable, ad_account_id, campaign_id)
-        result = run_cli(executable, args)
-        results.append(result)
+        params = {
+            "level": "ad",
+            "date_preset": window,
+            "fields": fields,
+            "limit": int(meta_api.get("limit", 500)),
+        }
 
-        if result["returncode"] != 0:
-            raise RuntimeError(
-                f"Meta Ads CLI insights command failed: {result['stderr'] or result['stdout']}"
-            )
+        rows, pages = graph_api_get_paginated_data(
+            config,
+            f"{campaign_id}/insights",
+            params,
+        )
 
-        rows = parse_json_output(result["stdout"])
         ensure_ad_level_insights(rows)
         all_ads.extend(rows)
 
+        results.append(
+            {
+                "command": [
+                    "meta-graph-api",
+                    f"/{public_campaign_ref(campaign_id)}/insights",
+                    "level=ad",
+                    f"date_preset={window}",
+                    f"fields={fields}",
+                ],
+                "returncode": 0,
+                "stdout": json.dumps(
+                    {
+                        "rows": len(rows),
+                        "pages": pages,
+                    },
+                    ensure_ascii=False,
+                ),
+                "stderr": "",
+            }
+        )
+
     return all_ads, results
+
+
+def fetch_ad_status(config: dict[str, Any], ad_id: str) -> str:
+    payload = graph_api_get_json(
+        config,
+        ad_id,
+        {
+            "fields": "effective_status,status",
+        },
+    )
+
+    return str(payload.get("effective_status") or payload.get("status") or "")
 
 
 def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
@@ -844,6 +872,7 @@ def main() -> int:
         "config": str(config_path),
         "mode": None,
         "ad_account_ref": None,
+        "fetch_source": "meta_graph_api",
         "ads_fetched": 0,
         "rules": [],
         "evaluation_summary": {},
@@ -877,7 +906,7 @@ def main() -> int:
         limited_matches = matches[:max_pauses]
 
         run_record["ads_fetched"] = len(ads)
-        run_record["meta_cli_fetch"] = sanitize_cli_results(fetch_result)
+        run_record["meta_api_fetch"] = sanitize_command_like_results(fetch_result)
         run_record["evaluation_summary"] = evaluation_summary
         run_record["evaluated_ads"] = ad_diagnostics
         run_record["matched_ads"] = [
@@ -887,6 +916,22 @@ def main() -> int:
 
         if mode == "active":
             for match in limited_matches:
+                current_status = fetch_ad_status(config, match.ad["ad_id"])
+
+                if current_status == PAUSED_STATUS:
+                    already_paused_record = {
+                        "timestamp": utc_now_iso(),
+                        "ad_account_id": ad_account_id,
+                        "ad_id": match.ad["ad_id"],
+                        "campaign_id": match.ad["campaign_id"],
+                        "rule": match.rule.get("name"),
+                        "reason": match.reason,
+                        "paused": False,
+                        "skip_reason": "already_paused_before_pause_call",
+                    }
+                    run_record["paused_ads"].append(sanitize_paused_record(already_paused_record))
+                    continue
+
                 pause_result = pause_ad(config, match.ad["ad_id"])
 
                 paused_record = {
