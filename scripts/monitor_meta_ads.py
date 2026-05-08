@@ -92,12 +92,15 @@ def secret_values() -> list[str]:
             continue
         if any(hint in key.upper() for hint in SENSITIVE_ENV_HINTS):
             values.append(value)
+
     account_id = os.getenv("META_AD_ACCOUNT_ID")
     if account_id:
         values.extend([account_id, account_id.removeprefix("act_")])
+
     room_id = os.getenv("CHATWORK_ROOM_ID")
     if room_id:
         values.append(room_id)
+
     allowed_campaign_ids = os.getenv("META_ALLOWED_CAMPAIGN_IDS")
     if allowed_campaign_ids:
         values.extend(
@@ -105,6 +108,7 @@ def secret_values() -> list[str]:
             for item in allowed_campaign_ids.replace("\n", ",").split(",")
             if item.strip()
         )
+
     return sorted(set(values), key=len, reverse=True)
 
 
@@ -134,11 +138,16 @@ def public_ad_ref(ad_id: Any) -> str:
     return f"ad_{short_hash(ad_id)}"
 
 
+def public_campaign_ref(campaign_id: Any) -> str:
+    return f"campaign_{short_hash(campaign_id)}"
+
+
 def sanitize_match(match: Match, selected_for_pause: bool) -> dict[str, Any]:
     return {
         "ad_ref": public_ad_ref(match.ad["ad_id"]),
+        "campaign_ref": public_campaign_ref(match.ad.get("campaign_id")),
         "rule": match.rule.get("name"),
-        "status": match.ad["status"],
+        "status": match.ad.get("status") or "",
         "selected_for_pause": selected_for_pause,
     }
 
@@ -159,12 +168,31 @@ def sanitize_paused_record(record: dict[str, Any]) -> dict[str, Any]:
         "timestamp": record.get("timestamp"),
         "ad_account_ref": short_hash(record.get("ad_account_id")),
         "ad_ref": public_ad_ref(record.get("ad_id")),
+        "campaign_ref": public_campaign_ref(record.get("campaign_id")),
         "rule": record.get("rule"),
+        "reason": record.get("reason"),
         "paused": record.get("paused"),
         "dry_run": record.get("dry_run", False),
         "meta_cli_result": sanitize_cli_result(record.get("meta_cli_result") or {}),
         "chatwork_notification": sanitize_chatwork_result(record.get("chatwork_notification") or {}),
     }
+
+
+def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
+    """Return only non-secret rule fields for logs."""
+    allowed_keys = {
+        "name",
+        "level",
+        "window",
+        "spend_gt",
+        "min_spend",
+        "conversions_lt",
+        "min_conversions",
+        "max_conversions",
+        "max_cpa",
+        "action",
+    }
+    return {key: rule.get(key) for key in allowed_keys if key in rule}
 
 
 def require_safe_config(config: dict[str, Any]) -> None:
@@ -384,52 +412,142 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
     }
 
 
-def evaluate_rule(ad: dict[str, Any], rule: dict[str, Any]) -> str | None:
+def evaluate_rule_with_diagnostic(ad: dict[str, Any], rule: dict[str, Any]) -> tuple[str | None, dict[str, Any]]:
     spend = float(ad["spend"])
     conversions = float(ad["conversions"])
     cpa = ad["cpa"]
 
+    diagnostic = {
+        "rule": rule.get("name"),
+        "matched": False,
+        "decision": None,
+        "detail": None,
+        "thresholds": rule_public_summary(rule),
+    }
+
     if "spend_gt" in rule and spend <= float(rule["spend_gt"]):
-        return None
+        diagnostic["decision"] = "spend_not_gt"
+        diagnostic["detail"] = f"spend={spend:g} threshold={float(rule['spend_gt']):g}"
+        return None, diagnostic
+
     if "min_spend" in rule and spend < float(rule["min_spend"]):
-        return None
+        diagnostic["decision"] = "spend_below_min"
+        diagnostic["detail"] = f"spend={spend:g} threshold={float(rule['min_spend']):g}"
+        return None, diagnostic
+
     if "conversions_lt" in rule and conversions >= float(rule["conversions_lt"]):
-        return None
+        diagnostic["decision"] = "conversions_not_lt"
+        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['conversions_lt']):g}"
+        return None, diagnostic
+
     if "min_conversions" in rule and conversions < float(rule["min_conversions"]):
-        return None
+        diagnostic["decision"] = "conversions_below_min"
+        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['min_conversions']):g}"
+        return None, diagnostic
+
     if "max_conversions" in rule and conversions > float(rule["max_conversions"]):
-        return None
+        diagnostic["decision"] = "conversions_above_max"
+        diagnostic["detail"] = f"conversions={conversions:g} threshold={float(rule['max_conversions']):g}"
+        return None, diagnostic
+
     if "max_cpa" in rule:
-        if cpa is None or cpa < float(rule["max_cpa"]):
-            return None
+        if cpa is None:
+            diagnostic["decision"] = "cpa_none"
+            diagnostic["detail"] = "cpa=None"
+            return None, diagnostic
+        if cpa < float(rule["max_cpa"]):
+            diagnostic["decision"] = "cpa_below_threshold"
+            diagnostic["detail"] = f"cpa={cpa:g} threshold={float(rule['max_cpa']):g}"
+            return None, diagnostic
 
-    parts = [f"rule={rule.get('name')}", f"spend={spend:g}", f"conversions={conversions:g}"]
+    reason_parts = [
+        f"rule={rule.get('name')}",
+        f"spend={spend:g}",
+        f"conversions={conversions:g}",
+    ]
     if cpa is not None:
-        parts.append(f"cpa={cpa:g}")
-    return ", ".join(parts)
+        reason_parts.append(f"cpa={cpa:g}")
+
+    reason = ", ".join(reason_parts)
+
+    diagnostic["matched"] = True
+    diagnostic["decision"] = "matched"
+    diagnostic["detail"] = reason
+
+    return reason, diagnostic
 
 
-def find_matches(ads: list[dict[str, Any]], config: dict[str, Any]) -> list[Match]:
+def find_matches_with_diagnostics(
+    ads: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> tuple[list[Match], list[dict[str, Any]], dict[str, int]]:
     conversion_event = (config.get("meta") or {}).get("conversion_event", "")
     allowed_campaign_ids = set(allowed_campaign_ids_from_config_or_env(config))
+
     matches: list[Match] = []
+    diagnostics: list[dict[str, Any]] = []
     matched_ad_ids: set[str] = set()
+
+    summary = {
+        "fetched": len(ads),
+        "not_allowed_campaign": 0,
+        "already_paused": 0,
+        "missing_ad_id": 0,
+        "evaluated": 0,
+        "matched": 0,
+    }
 
     for raw in ads:
         ad = normalize_ad(raw, conversion_event)
+
+        diagnostic = {
+            "ad_ref": public_ad_ref(ad.get("ad_id") or "missing"),
+            "campaign_ref": public_campaign_ref(ad.get("campaign_id") or "missing"),
+            "spend": ad.get("spend"),
+            "conversions": ad.get("conversions"),
+            "cpa": ad.get("cpa"),
+            "status": ad.get("status") or "",
+            "skipped": False,
+            "skip_reason": None,
+            "rule_evaluations": [],
+        }
+
         if ad["campaign_id"] not in allowed_campaign_ids:
+            summary["not_allowed_campaign"] += 1
+            diagnostic["skipped"] = True
+            diagnostic["skip_reason"] = "campaign_not_allowed"
+            diagnostics.append(diagnostic)
             continue
+
         if ad["status"] == PAUSED_STATUS:
+            summary["already_paused"] += 1
+            diagnostic["skipped"] = True
+            diagnostic["skip_reason"] = "already_paused"
+            diagnostics.append(diagnostic)
             continue
+
         if not ad["ad_id"]:
+            summary["missing_ad_id"] += 1
+            diagnostic["skipped"] = True
+            diagnostic["skip_reason"] = "missing_ad_id"
+            diagnostics.append(diagnostic)
             continue
+
+        summary["evaluated"] += 1
+
         for rule in config.get("rules") or []:
-            reason = evaluate_rule(ad, rule)
+            reason, rule_diagnostic = evaluate_rule_with_diagnostic(ad, rule)
+            diagnostic["rule_evaluations"].append(rule_diagnostic)
+
             if reason and ad["ad_id"] not in matched_ad_ids:
                 matches.append(Match(ad=ad, rule=rule, reason=reason))
                 matched_ad_ids.add(ad["ad_id"])
+                summary["matched"] += 1
                 break
-    return matches
+
+        diagnostics.append(diagnostic)
+
+    return matches, diagnostics, summary
 
 
 def insights_window(config: dict[str, Any]) -> str:
@@ -500,7 +618,7 @@ def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
     args = format_args(args_template, {"ad_id": ad_id, "status": PAUSED_STATUS})
     result = run_cli(executable, args)
     if result["returncode"] != 0:
-        raise RuntimeError(f"Meta Ads CLI pause command failed for {ad_id}: {result['stderr'] or result['stdout']}")
+        raise RuntimeError(f"Meta Ads CLI pause command failed for {public_ad_ref(ad_id)}: {redact_text(result['stderr'] or result['stdout'])}")
     return result
 
 
@@ -508,12 +626,11 @@ def build_chatwork_message(paused_record: dict[str, Any]) -> str:
     return "\n".join(
         [
             "[info][title]Meta ad paused[/title]",
-            f"Ad ID: {paused_record['ad_id']}",
-            f"Ad name: {paused_record.get('ad_name') or '-'}",
-            f"Campaign ID: {paused_record.get('campaign_id') or '-'}",
+            f"Ad ref: {public_ad_ref(paused_record.get('ad_id'))}",
+            f"Campaign ref: {public_campaign_ref(paused_record.get('campaign_id'))}",
             f"Rule: {paused_record.get('rule') or '-'}",
             f"Reason: {paused_record.get('reason') or '-'}",
-            f"Ad account: {paused_record.get('ad_account_id') or '-'}",
+            f"Ad account ref: {short_hash(paused_record.get('ad_account_id'))}",
             f"Run time (UTC): {paused_record.get('timestamp') or '-'}",
             "[/info]",
         ]
@@ -575,12 +692,16 @@ def main() -> int:
     load_dotenv(PROJECT_ROOT / ".env")
     sync_meta_cli_env()
     config_path = Path(args.config).resolve()
+
     run_record: dict[str, Any] = {
         "timestamp": utc_now_iso(),
         "config": str(config_path),
         "mode": None,
         "ad_account_ref": None,
         "ads_fetched": 0,
+        "rules": [],
+        "evaluation_summary": {},
+        "evaluated_ads": [],
         "matched_ads": [],
         "paused_ads": [],
         "errors": [],
@@ -590,18 +711,26 @@ def main() -> int:
         config = load_config(config_path)
         require_safe_config(config)
         require_token()
+
         ad_account_id = resolve_ad_account_id(config)
         mode = config.get("mode", "dry_run")
         max_pauses = int((config.get("safety") or {}).get("max_pauses_per_run", 3))
+
         run_record["mode"] = mode
         run_record["ad_account_ref"] = short_hash(ad_account_id)
+        run_record["rules"] = [
+            rule_public_summary(rule)
+            for rule in (config.get("rules") or [])
+        ]
 
         ads, fetch_result = fetch_insights(config, ad_account_id)
-        matches = find_matches(ads, config)
+        matches, ad_diagnostics, evaluation_summary = find_matches_with_diagnostics(ads, config)
         limited_matches = matches[:max_pauses]
 
         run_record["ads_fetched"] = len(ads)
         run_record["meta_cli_fetch"] = sanitize_cli_results(fetch_result)
+        run_record["evaluation_summary"] = evaluation_summary
+        run_record["evaluated_ads"] = ad_diagnostics
         run_record["matched_ads"] = [
             sanitize_match(match, match in limited_matches)
             for match in matches
@@ -623,10 +752,13 @@ def main() -> int:
                 }
                 chatwork_result = notify_chatwork(build_chatwork_message(paused_record))
                 paused_record["chatwork_notification"] = chatwork_result
+
                 if chatwork_result.get("enabled") and not chatwork_result.get("sent"):
                     run_record["errors"].append(
-                        f"Chatwork notification failed for {public_ad_ref(match.ad['ad_id'])}: {redact_text(chatwork_result.get('error') or chatwork_result.get('status'))}"
+                        f"Chatwork notification failed for {public_ad_ref(match.ad['ad_id'])}: "
+                        f"{redact_text(chatwork_result.get('error') or chatwork_result.get('status'))}"
                     )
+
                 sanitized_paused_record = sanitize_paused_record(paused_record)
                 run_record["paused_ads"].append(sanitized_paused_record)
                 append_jsonl(PAUSED_LOG, sanitized_paused_record)
@@ -638,6 +770,7 @@ def main() -> int:
                             "timestamp": utc_now_iso(),
                             "ad_account_id": ad_account_id,
                             "ad_id": match.ad["ad_id"],
+                            "campaign_id": match.ad["campaign_id"],
                             "rule": match.rule.get("name"),
                             "reason": match.reason,
                             "paused": False,
