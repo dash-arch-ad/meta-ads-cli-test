@@ -159,12 +159,8 @@ def build_request_payload(ai_input: dict[str, Any]) -> dict[str, Any]:
         ],
         "generationConfig": {
             "temperature": 0.2,
-            "responseFormat": {
-                "text": {
-                    "mimeType": "application/json",
-                    "schema": ADVISOR_RESPONSE_SCHEMA,
-                }
-            },
+            "responseMimeType": "application/json",
+            "responseJsonSchema": ADVISOR_RESPONSE_SCHEMA,
         },
     }
 
@@ -431,21 +427,49 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
 
 
 def build_chatwork_message(result: dict[str, Any], config: dict[str, Any]) -> str:
-    if result.get("error"):
-        if result.get("error_type") == "api_error":
-            return ""
+    input_summary = result.get("input_summary") or {}
 
+    if result.get("skipped"):
+        return "\n".join(
+            [
+                "【配信テスト中】Meta広告 AI運用提案",
+                "",
+                "※AI提案はスキップされました。停止・再開・バナー追加は自動実行していません。",
+                "",
+                "■ 状態",
+                f"理由: {result.get('skip_reason') or '-'}",
+                f"model: {result.get('model') or '-'}",
+                f"AI入力広告数: {input_summary.get('ads', '-')}",
+            ]
+        )
+
+    if result.get("error"):
         return "\n".join(
             [
                 "【配信テスト中】Meta広告 AI運用提案",
                 "",
                 "※AI提案生成失敗。停止・再開・バナー追加は自動実行していません。",
+                "",
+                "■ 状態",
+                f"種別: {result.get('error_type') or 'unknown'}",
+                f"model: {result.get('model') or '-'}",
+                f"AI入力広告数: {input_summary.get('ads', '-')}",
             ]
         )
 
     proposal = result.get("proposal")
     if not proposal:
-        return ""
+        return "\n".join(
+            [
+                "【配信テスト中】Meta広告 AI運用提案",
+                "",
+                "※AI提案は生成されませんでした。停止・再開・バナー追加は自動実行していません。",
+                "",
+                "■ 状態",
+                f"model: {result.get('model') or '-'}",
+                f"AI入力広告数: {input_summary.get('ads', '-')}",
+            ]
+        )
 
     notification = config.get("notification") or {}
     max_items = int(notification.get("max_items_per_section", 5) or 5)
