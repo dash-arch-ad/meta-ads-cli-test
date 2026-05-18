@@ -37,7 +37,7 @@ schedule:
   interval_minutes: 30
 
 rules:
-  - name: zero_purchase_50000_pause
+  - name: zero_purchase_64000_pause
     level: ad
     window: "last_90d"
     spend_gt: 50000

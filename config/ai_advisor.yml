@@ -1,0 +1,28 @@
+enabled: true
+
+provider: gemini
+model_env: GEMINI_MODEL
+
+objective: CPAを悪化させずCVを増やす
+
+thresholds:
+  target_cpa: 5000
+  min_spend_for_pause_review: 3000
+  min_spend_for_creative_review: 2000
+  min_conversions_for_keep: 1
+  min_conversions_for_scale_review: 2
+
+actions:
+  allow_pause_suggestion: true
+  allow_resume_suggestion: true
+  allow_creative_suggestion: true
+  allow_auto_pause_by_ai: false
+  allow_auto_resume_by_ai: false
+  allow_auto_create_ads_by_ai: false
+
+notification:
+  include_ai_summary: true
+  include_pause_candidates: true
+  include_resume_candidates: true
+  include_creative_suggestions: true
+  max_items_per_section: 5
