@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -63,11 +64,12 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
         "summary": {"type": "string"},
-        "pause_candidates": {"type": "array", "items": AD_DECISION_SCHEMA},
-        "keep_candidates": {"type": "array", "items": AD_DECISION_SCHEMA},
-        "resume_candidates": {"type": "array", "items": AD_DECISION_SCHEMA},
+        "pause_candidates": {"type": "array", "maxItems": 3, "items": AD_DECISION_SCHEMA},
+        "keep_candidates": {"type": "array", "maxItems": 3, "items": AD_DECISION_SCHEMA},
+        "resume_candidates": {"type": "array", "maxItems": 3, "items": AD_DECISION_SCHEMA},
         "creative_suggestions": {
             "type": "array",
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "properties": {
@@ -81,6 +83,7 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
         },
         "warnings": {
             "type": "array",
+            "maxItems": 3,
             "items": {
                 "type": "object",
                 "properties": {
@@ -124,52 +127,99 @@ def resolve_model(config: dict[str, Any]) -> str:
     return os.getenv(model_env) or str(config.get("model") or DEFAULT_MODEL)
 
 
-def prompt_for(ai_input: dict[str, Any]) -> str:
+def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
+    if compact_retry:
+        return "\n".join(
+            [
+                "Return only one valid JSON object. No markdown.",
+                "You are an ad-operations advisor. Propose only; never execute changes.",
+                "Allowed actions: pause_review, keep, watch, resume_test_review, creative_test_review, measurement_check, lp_check.",
+                "Forbidden actions: pause_now, resume_now, increase_budget_now, create_ad_now, change_campaign_now.",
+                "Use these exact keys: summary, pause_candidates, keep_candidates, resume_candidates, creative_suggestions, warnings.",
+                "All arrays must have at most 2 items. Keep Japanese text short.",
+                "Data:",
+                json.dumps(ai_input, ensure_ascii=False, separators=(",", ":")),
+            ]
+        )
+
     return "\n".join(
         [
-            "あなたはMeta広告運用の分析アシスタントです。",
-            "提案のみ行い、停止・再開・予算増額・広告作成・キャンペーン変更は実行判断しません。",
-            "必ず指定JSON Schemaに沿った短いJSONだけを返してください。",
+            "Return only valid JSON that matches the schema. No markdown.",
+            "You are a Meta ads operations advisor.",
+            "Make proposals only. Never execute or recommend immediate execution.",
             "",
-            "許可されるrecommended_action:",
+            "Allowed recommended_action:",
             ", ".join(sorted(ALLOWED_ACTIONS)),
             "",
-            "禁止されるrecommended_action:",
+            "Forbidden recommended_action:",
             ", ".join(sorted(FORBIDDEN_ACTIONS)),
             "",
-            "判断方針:",
-            "- 消化額が最低額未満の広告は停止候補にしない。",
-            "- CVが出ている広告を停止検討に入れる場合は慎重に理由を書く。",
-            "- 計測異常や判断保留があればwarningsに入れる。",
-            "- 新規バナー案は実行指示ではなく、訴求テーマの提案に限定する。",
+            "Rules:",
+            "- Write Japanese values.",
+            "- summary <= 80 Japanese chars.",
+            "- each array <= 3 items.",
+            "- reason/message <= 60 Japanese chars.",
+            "- Do not put low-spend ads in pause_candidates.",
+            "- If an ad has conversions, be cautious about pause review.",
+            "- Put measurement or pending-judgment issues in warnings.",
+            "- Creative ideas are message themes only, not execution instructions.",
             "",
-            "入力データ:",
+            "Data:",
             json.dumps(ai_input, ensure_ascii=False, separators=(",", ":")),
         ]
     )
 
 
-def build_request_payload(ai_input: dict[str, Any]) -> dict[str, Any]:
+def build_request_payload(
+    ai_input: dict[str, Any],
+    config: dict[str, Any] | None = None,
+    *,
+    use_schema: bool = True,
+    compact_retry: bool = False,
+) -> dict[str, Any]:
+    config = config or {}
+    generation_config: dict[str, Any] = {
+        "temperature": 0.1,
+        "maxOutputTokens": int(config.get("max_output_tokens", 2048) or 2048),
+        "responseMimeType": "application/json",
+        "thinkingConfig": {
+            "thinkingBudget": int(config.get("thinking_budget", 0) or 0),
+        },
+    }
+
+    if use_schema:
+        generation_config["responseJsonSchema"] = ADVISOR_RESPONSE_SCHEMA
+
     return {
         "contents": [
             {
                 "role": "user",
-                "parts": [{"text": prompt_for(ai_input)}],
+                "parts": [{"text": prompt_for(ai_input, compact_retry=compact_retry)}],
             }
         ],
-        "generationConfig": {
-            "temperature": 0.2,
-            "maxOutputTokens": 2048,
-            "responseMimeType": "application/json",
-            "responseJsonSchema": ADVISOR_RESPONSE_SCHEMA,
-        },
+        "generationConfig": generation_config,
     }
 
 
-def call_gemini(ai_input: dict[str, Any], config: dict[str, Any], api_key: str) -> dict[str, Any]:
+def call_gemini(
+    ai_input: dict[str, Any],
+    config: dict[str, Any],
+    api_key: str,
+    *,
+    use_schema: bool = True,
+    compact_retry: bool = False,
+) -> dict[str, Any]:
     model = resolve_model(config)
     url = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
-    payload = json.dumps(build_request_payload(ai_input), ensure_ascii=False).encode("utf-8")
+    payload = json.dumps(
+        build_request_payload(
+            ai_input,
+            config,
+            use_schema=use_schema,
+            compact_retry=compact_retry,
+        ),
+        ensure_ascii=False,
+    ).encode("utf-8")
     request = urllib.request.Request(
         url,
         data=payload,
@@ -193,12 +243,14 @@ def call_gemini(ai_input: dict[str, Any], config: dict[str, Any], api_key: str) 
 
     text = extract_text(api_payload)
     try:
-        response_json = json.loads(text)
+        response_json = parse_json_object_text(text)
     except json.JSONDecodeError as exc:
-        raise ValueError(f"Gemini response was not valid JSON: {text[:800]}") from exc
-
-    if not isinstance(response_json, dict):
-        raise ValueError("Gemini response JSON root must be an object.")
+        first_candidate = (api_payload.get("candidates") or [{}])[0]
+        finish_reason = first_candidate.get("finishReason") or "unknown"
+        raise ValueError(
+            "Gemini response was not valid JSON: "
+            f"finish_reason={finish_reason}, text={text[:800]}"
+        ) from exc
 
     return {
         "model": model,
@@ -219,6 +271,29 @@ def extract_text(api_payload: dict[str, Any]) -> str:
         raise ValueError("Gemini response did not include text.")
 
     return text
+
+
+def parse_json_object_text(text: str) -> dict[str, Any]:
+    cleaned = text.strip()
+
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("`").strip()
+        if cleaned.lower().startswith("json"):
+            cleaned = cleaned[4:].strip()
+
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError:
+        start = cleaned.find("{")
+        end = cleaned.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(cleaned[start : end + 1])
+
+    if not isinstance(payload, dict):
+        raise ValueError("Gemini response JSON root must be an object.")
+
+    return payload
 
 
 def validate_proposal(
@@ -388,6 +463,8 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
         "validation_notes": [],
         "error": None,
         "error_type": None,
+        "api_calls": 0,
+        "retried": False,
     }
 
     if not result["enabled"]:
@@ -407,14 +484,48 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
         return result
 
     try:
-        gemini_result = call_gemini(ai_input, config, api_key)
         result["sent_to_model"] = True
+        result["api_calls"] = 1
+        gemini_result = call_gemini(ai_input, config, api_key)
         result["model"] = gemini_result["model"]
         proposal, validation_notes = validate_proposal(gemini_result["proposal"], ai_input, config)
         result["proposal"] = proposal
         result["validation_notes"] = validation_notes
         return result
+    except (TimeoutError, socket.timeout) as exc:
+        result["error"] = str(exc)
+        result["error_type"] = "api_timeout"
+        return result
     except ValueError as exc:
+        max_calls = int(config.get("max_gemini_calls_per_run", 1) or 1)
+        if bool(config.get("retry_on_invalid_json", False)) and max_calls >= 2:
+            try:
+                result["retried"] = True
+                result["api_calls"] = 2
+                gemini_result = call_gemini(
+                    ai_input,
+                    config,
+                    api_key,
+                    use_schema=False,
+                    compact_retry=True,
+                )
+                result["model"] = gemini_result["model"]
+                proposal, validation_notes = validate_proposal(
+                    gemini_result["proposal"],
+                    ai_input,
+                    config,
+                )
+                result["proposal"] = proposal
+                result["validation_notes"] = [
+                    "retried_without_schema_after_invalid_json",
+                    *validation_notes,
+                ]
+                return result
+            except Exception as retry_exc:
+                result["error"] = f"first={exc}; retry={retry_exc}"
+                result["error_type"] = "invalid_response"
+                return result
+
         result["error"] = str(exc)
         result["error_type"] = "invalid_response"
         return result
@@ -442,6 +553,7 @@ def build_chatwork_message(result: dict[str, Any], config: dict[str, Any]) -> st
                 f"理由: {result.get('skip_reason') or '-'}",
                 f"model: {result.get('model') or '-'}",
                 f"AI入力広告数: {input_summary.get('ads', '-')}",
+                f"Gemini呼び出し回数: {result.get('api_calls', 0)}",
             ]
         )
 
@@ -456,6 +568,7 @@ def build_chatwork_message(result: dict[str, Any], config: dict[str, Any]) -> st
                 f"種別: {result.get('error_type') or 'unknown'}",
                 f"model: {result.get('model') or '-'}",
                 f"AI入力広告数: {input_summary.get('ads', '-')}",
+                f"Gemini呼び出し回数: {result.get('api_calls', 0)}",
             ]
         )
 
@@ -470,6 +583,7 @@ def build_chatwork_message(result: dict[str, Any], config: dict[str, Any]) -> st
                 "■ 状態",
                 f"model: {result.get('model') or '-'}",
                 f"AI入力広告数: {input_summary.get('ads', '-')}",
+                f"Gemini呼び出し回数: {result.get('api_calls', 0)}",
             ]
         )
 
