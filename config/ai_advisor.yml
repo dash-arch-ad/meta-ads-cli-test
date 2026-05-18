@@ -3,7 +3,19 @@ enabled: true
 provider: gemini
 model_env: GEMINI_MODEL
 timeout_seconds: 20
-max_ads: 12
+max_ads: 8
+max_output_tokens: 2048
+thinking_budget: 0
+max_gemini_calls_per_run: 2
+retry_on_invalid_json: true
+
+free_tier_guardrails:
+  expected_runs_per_day: 48
+  max_calls_per_run: 2
+  expected_max_calls_per_day: 96
+  gemini_2_5_flash_free_rpd: 250
+  gemini_2_5_flash_free_rpm: 10
+  gemini_2_5_flash_free_tpm: 250000
 
 objective: CPAを悪化させずCVを増やす
 
