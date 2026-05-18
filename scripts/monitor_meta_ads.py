@@ -670,6 +670,7 @@ def build_ai_advisor_input(
     allowed_campaign_ids = set(allowed_campaign_ids_from_config_or_env(guard_config))
     thresholds = ai_config.get("thresholds") or {}
     window = allowed_graph_date_preset(insights_window(guard_config))
+    max_ads = int(ai_config.get("max_ads", 12) or 12)
 
     ai_ads: list[dict[str, Any]] = []
 
@@ -696,8 +697,6 @@ def build_ai_advisor_input(
             {
                 "ad_ref": public_ad_ref(ad["ad_id"]),
                 "campaign_ref": public_campaign_ref(ad["campaign_id"]),
-                "ad_name": str(ad.get("ad_name") or ""),
-                "campaign_name": str(ad.get("campaign_name") or ""),
                 "configured_status": ad.get("configured_status") or "",
                 "effective_status": ad.get("effective_status") or "",
                 "spend": round(spend, 2),
@@ -709,6 +708,14 @@ def build_ai_advisor_input(
                 "rule_decision": ai_rule_decision(ad, guard_config),
             }
         )
+
+    ai_ads = sorted(
+        ai_ads,
+        key=lambda item: (
+            0 if str(item.get("configured_status")) == ACTIVE_STATUS else 1,
+            -float(item.get("spend") or 0),
+        ),
+    )[:max_ads]
 
     return {
         "run_context": {

@@ -128,8 +128,8 @@ def prompt_for(ai_input: dict[str, Any]) -> str:
     return "\n".join(
         [
             "あなたはMeta広告運用の分析アシスタントです。",
-            "停止・再開・予算増額・広告作成・キャンペーン変更は絶対に実行判断しません。",
-            "返す内容は提案のみで、必ず指定JSON Schemaに沿ったJSONだけにしてください。",
+            "提案のみ行い、停止・再開・予算増額・広告作成・キャンペーン変更は実行判断しません。",
+            "必ず指定JSON Schemaに沿った短いJSONだけを返してください。",
             "",
             "許可されるrecommended_action:",
             ", ".join(sorted(ALLOWED_ACTIONS)),
@@ -159,6 +159,7 @@ def build_request_payload(ai_input: dict[str, Any]) -> dict[str, Any]:
         ],
         "generationConfig": {
             "temperature": 0.2,
+            "maxOutputTokens": 2048,
             "responseMimeType": "application/json",
             "responseJsonSchema": ADVISOR_RESPONSE_SCHEMA,
         },
@@ -180,7 +181,8 @@ def call_gemini(ai_input: dict[str, Any], config: dict[str, Any], api_key: str) 
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=45) as response:
+        timeout = int(config.get("timeout_seconds", 20) or 20)
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             api_payload = json.loads(body)
     except urllib.error.HTTPError as exc:
