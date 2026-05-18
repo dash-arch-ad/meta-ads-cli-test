@@ -17,6 +17,12 @@ from typing import Any
 
 import yaml
 
+from ai_advisor_gemini import (
+    build_chatwork_message as build_ai_chatwork_message,
+    load_ai_config,
+    run_ai_advisor,
+)
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,7 +32,8 @@ ACTIVE_STATUS = "ACTIVE"
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
 DEFAULT_INSIGHTS_FIELDS = (
-    "ad_id,ad_name,campaign_id,campaign_name,spend,conversions,actions,date_start,date_stop"
+    "ad_id,ad_name,campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,"
+    "conversions,actions,date_start,date_stop"
 )
 
 DATE_PRESET_FALLBACKS = {
@@ -92,6 +99,10 @@ def secret_values() -> list[str]:
             continue
         if any(hint in key.upper() for hint in SENSITIVE_ENV_HINTS):
             values.append(value)
+
+    guard_env = os.getenv("META_GUARD_ENV")
+    if guard_env:
+        values.append(guard_env)
 
     account_id = os.getenv("META_AD_ACCOUNT_ID")
     if account_id:
@@ -609,6 +620,108 @@ def find_matches(
     return matches, summary, matched_ads_summary, decision_counts
 
 
+def rounded(value: Any, digits: int = 2) -> float | None:
+    if value is None or value == "":
+        return None
+
+    numeric = number(value, default=0.0)
+    return round(numeric, digits)
+
+
+def safe_rate(numerator: float, denominator: float, multiplier: float = 100.0) -> float | None:
+    if denominator <= 0:
+        return None
+
+    return round((numerator / denominator) * multiplier, 2)
+
+
+def ai_rule_decision(ad: dict[str, Any], config: dict[str, Any]) -> str:
+    if ad.get("state_check_error"):
+        return "state_check_failed"
+
+    if not ad.get("is_active"):
+        status = ad.get("effective_status") or ad.get("configured_status") or "unknown"
+        return f"not_active:{status}"
+
+    first_not_matched_decision = None
+
+    for rule in config.get("rules") or []:
+        reason, decision = evaluate_rule(ad, rule)
+        if reason:
+            return f"matched:{rule.get('name') or 'rule'}"
+
+        if first_not_matched_decision is None:
+            first_not_matched_decision = decision
+
+    return first_not_matched_decision or "not_matched"
+
+
+def build_ai_advisor_input(
+    ads: list[dict[str, Any]],
+    guard_config: dict[str, Any],
+    ai_config: dict[str, Any],
+    mode: str,
+) -> dict[str, Any]:
+    conversion_event = (guard_config.get("meta") or {}).get("conversion_event", "")
+    allowed_campaign_ids = set(allowed_campaign_ids_from_config_or_env(guard_config))
+    thresholds = ai_config.get("thresholds") or {}
+    window = allowed_graph_date_preset(insights_window(guard_config))
+
+    ai_ads: list[dict[str, Any]] = []
+
+    for raw in ads:
+        ad = normalize_ad(raw, conversion_event)
+
+        if ad["campaign_id"] not in allowed_campaign_ids or not ad["ad_id"]:
+            continue
+
+        spend = float(ad["spend"])
+        conversions = float(ad["conversions"])
+        impressions = number(ad.get("impressions"))
+        clicks = number(ad.get("clicks") or ad.get("inline_link_clicks"))
+        ctr = rounded(ad.get("ctr"))
+        cpc = rounded(ad.get("cpc"))
+
+        if ctr is None:
+            ctr = safe_rate(clicks, impressions)
+
+        if cpc is None and clicks > 0:
+            cpc = round(spend / clicks, 2)
+
+        ai_ads.append(
+            {
+                "ad_ref": public_ad_ref(ad["ad_id"]),
+                "campaign_ref": public_campaign_ref(ad["campaign_id"]),
+                "ad_name": str(ad.get("ad_name") or ""),
+                "campaign_name": str(ad.get("campaign_name") or ""),
+                "configured_status": ad.get("configured_status") or "",
+                "effective_status": ad.get("effective_status") or "",
+                "spend": round(spend, 2),
+                "conversions": round(conversions, 2),
+                "cpa": round(ad["cpa"], 2) if ad.get("cpa") is not None else None,
+                "ctr": ctr,
+                "cpc": cpc,
+                "cvr": safe_rate(conversions, clicks),
+                "rule_decision": ai_rule_decision(ad, guard_config),
+            }
+        )
+
+    return {
+        "run_context": {
+            "mode": mode,
+            "window": window,
+            "objective": ai_config.get("objective") or "CPAを悪化させずCVを増やす",
+            "notice": "AIは提案のみ。実行はしない。",
+        },
+        "rules": {
+            "target_cpa": thresholds.get("target_cpa"),
+            "min_spend_for_pause_review": thresholds.get("min_spend_for_pause_review"),
+            "min_conversions_for_scale_review": thresholds.get("min_conversions_for_scale_review"),
+        },
+        "ads": ai_ads,
+    }
+
+
 def insights_window(config: dict[str, Any]) -> str:
     windows = {
         str(rule.get("window"))
@@ -725,6 +838,7 @@ def build_test_status_chatwork_message(output: dict[str, Any]) -> str:
     evaluation = output.get("evaluation_summary") or {}
     decision_counts = output.get("decision_counts") or {}
     fetch_items = output.get("fetch") or []
+    ai_message = (output.get("ai_advisor") or {}).get("chatwork_message")
 
     lines = [
         "【配信テスト中】Meta広告 自動監視ステータス",
@@ -777,6 +891,9 @@ def build_test_status_chatwork_message(output: dict[str, Any]) -> str:
             )
     else:
         lines.append("-")
+
+    if ai_message:
+        lines.extend(["", ai_message])
 
     return "\n".join(lines)
 
@@ -879,6 +996,7 @@ def main() -> int:
         "decision_counts": {},
         "matched_ads": [],
         "paused_ads": [],
+        "ai_advisor": {},
         "test_status_chatwork": {},
         "errors": [],
     }
@@ -915,6 +1033,26 @@ def main() -> int:
         }
         output["decision_counts"] = decision_counts
         output["matched_ads"] = matched_ads_summary
+
+        try:
+            ai_config = load_ai_config(PROJECT_ROOT / "config" / "ai_advisor.yml")
+            ai_input = build_ai_advisor_input(ads, config, ai_config, mode)
+            ai_result = run_ai_advisor(ai_input, ai_config)
+            ai_result["input_summary"] = {
+                "ads": len(ai_input.get("ads") or []),
+                "window": (ai_input.get("run_context") or {}).get("window"),
+            }
+            ai_result["chatwork_message"] = build_ai_chatwork_message(ai_result, ai_config)
+            output["ai_advisor"] = ai_result
+        except Exception as exc:
+            output["ai_advisor"] = {
+                "enabled": False,
+                "provider": "gemini",
+                "sent_to_model": False,
+                "skipped": False,
+                "error": redact_text(exc),
+                "chatwork_message": "【配信テスト中】Meta広告 AI運用提案\n\n※AI提案生成失敗。停止・再開・バナー追加は自動実行していません。",
+            }
 
         test_status_result = notify_chatwork(build_test_status_chatwork_message(output))
         output["test_status_chatwork"] = {
