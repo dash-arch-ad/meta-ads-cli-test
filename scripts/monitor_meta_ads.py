@@ -386,7 +386,6 @@ def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
     return 0.0
 
 
-
 def fetch_ad_state(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
     payload = graph_api_request_json(
         config,
@@ -722,6 +721,66 @@ def build_chatwork_message(paused_record: dict[str, Any]) -> str:
     )
 
 
+def build_test_status_chatwork_message(output: dict[str, Any]) -> str:
+    evaluation = output.get("evaluation_summary") or {}
+    decision_counts = output.get("decision_counts") or {}
+    fetch_items = output.get("fetch") or []
+
+    lines = [
+        "【配信テスト中】Meta広告 自動監視ステータス",
+        "",
+        "※現在は配信テスト中のため、停止条件に達していない場合でもステータスを通知しています。",
+        "",
+        f"mode: {output.get('mode') or '-'}",
+        f"Run time (UTC): {output.get('timestamp') or '-'}",
+        "",
+        "■ 全体サマリー",
+        f"取得広告数: {evaluation.get('fetched', 0)}",
+        f"評価対象広告数: {evaluation.get('evaluated', 0)}",
+        f"停止条件一致: {evaluation.get('matched', 0)}",
+        f"停止選択数: {evaluation.get('selected_for_pause', 0)}",
+        f"上限超過で未選択: {evaluation.get('not_selected_due_to_max_pauses', 0)}",
+        f"対象外キャンペーン: {evaluation.get('not_allowed_campaign', 0)}",
+        f"停止済み・非ACTIVE広告: {evaluation.get('not_active_before_evaluation', 0)}",
+        f"広告ID欠落: {evaluation.get('missing_ad_id', 0)}",
+        f"状態確認失敗: {evaluation.get('state_check_failed', 0)}",
+        "",
+        "■ 判定内訳",
+    ]
+
+    if decision_counts:
+        for key, value in sorted(decision_counts.items()):
+            lines.append(f"{key}: {value}")
+    else:
+        lines.append("-")
+
+    lines.extend(
+        [
+            "",
+            "■ キャンペーン別取得状況",
+        ]
+    )
+
+    if fetch_items:
+        for item in fetch_items:
+            state = item.get("state_summary") or {}
+            lines.append(
+                " / ".join(
+                    [
+                        f"campaign: {item.get('campaign_ref') or '-'}",
+                        f"rows: {item.get('rows', 0)}",
+                        f"active: {state.get('active', 0)}",
+                        f"not_active: {state.get('not_active', 0)}",
+                        f"state_check_failed: {state.get('state_check_failed', 0)}",
+                    ]
+                )
+            )
+    else:
+        lines.append("-")
+
+    return "\n".join(lines)
+
+
 def notify_chatwork(message: str) -> dict[str, Any]:
     token = os.getenv("CHATWORK_API_TOKEN")
     room_id = os.getenv("CHATWORK_ROOM_ID")
@@ -820,6 +879,7 @@ def main() -> int:
         "decision_counts": {},
         "matched_ads": [],
         "paused_ads": [],
+        "test_status_chatwork": {},
         "errors": [],
     }
 
@@ -855,6 +915,21 @@ def main() -> int:
         }
         output["decision_counts"] = decision_counts
         output["matched_ads"] = matched_ads_summary
+
+        test_status_result = notify_chatwork(build_test_status_chatwork_message(output))
+        output["test_status_chatwork"] = {
+            "enabled": test_status_result.get("enabled", False),
+            "sent": test_status_result.get("sent", False),
+            "status": test_status_result.get("status"),
+            "error": test_status_result.get("error"),
+            "reason": test_status_result.get("reason"),
+        }
+
+        if test_status_result.get("enabled") and not test_status_result.get("sent"):
+            output["errors"].append(
+                "Chatwork test status notification failed: "
+                f"{redact_text(test_status_result.get('error') or test_status_result.get('status'))}"
+            )
 
         if mode == "active":
             for match in limited_matches:
