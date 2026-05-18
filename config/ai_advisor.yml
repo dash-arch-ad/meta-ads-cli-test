@@ -2,6 +2,8 @@ enabled: true
 
 provider: gemini
 model_env: GEMINI_MODEL
+timeout_seconds: 20
+max_ads: 12
 
 objective: CPAを悪化させずCVを増やす
 
