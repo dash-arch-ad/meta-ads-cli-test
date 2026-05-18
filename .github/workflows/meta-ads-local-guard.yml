@@ -46,5 +46,43 @@ jobs:
               print("META_GUARD_ENV is not set; using individual GitHub Secrets from job env.")
           PY
 
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          python - <<'PY'
+          import os
+          import sys
+
+          def from_guard_env(key):
+              prefix = f"{key}="
+              for raw_line in os.environ.get("META_GUARD_ENV", "").splitlines():
+                  line = raw_line.strip()
+                  if line.startswith(prefix):
+                      return line.split("=", 1)[1].strip().strip('"').strip("'")
+              return ""
+
+          required = [
+              "META_ACCESS_TOKEN",
+              "META_AD_ACCOUNT_ID",
+              "META_ALLOWED_CAMPAIGN_IDS",
+          ]
+          missing = [
+              key
+              for key in required
+              if not (os.environ.get(key) or from_guard_env(key)).strip()
+          ]
+
+          if missing:
+              print("Missing required GitHub Secrets or META_GUARD_ENV entries:")
+              for key in missing:
+                  print(f"- {key}")
+              print("")
+              print("Set META_ALLOWED_CAMPAIGN_IDS to comma-separated target campaign IDs.")
+              print("Example: 120000000000001,120000000000002")
+              sys.exit(1)
+
+          print("Required Meta secrets are present.")
+          PY
+
       - name: Run guard
         run: python scripts/monitor_meta_ads.py --config config/rules.yml
