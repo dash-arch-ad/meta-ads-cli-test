@@ -66,7 +66,9 @@ def load_dotenv(path: Path) -> None:
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
-        os.environ.setdefault(key, value)
+
+        if key not in os.environ or not os.environ[key].strip():
+            os.environ[key] = value
 
 
 def load_config(path: Path) -> dict[str, Any]:
