@@ -191,7 +191,9 @@ def require_safe_config(config: dict[str, Any]) -> None:
     allowed_campaign_ids = allowed_campaign_ids_from_config_or_env(config)
     if not allowed_campaign_ids:
         raise ValueError(
-            "Unsafe config: META_ALLOWED_CAMPAIGN_IDS or target.allowed_campaign_ids must not be empty."
+            "Unsafe config: META_ALLOWED_CAMPAIGN_IDS or target.allowed_campaign_ids must not be empty. "
+            "Set META_ALLOWED_CAMPAIGN_IDS to comma-separated target campaign IDs. "
+            "The SET_META_ALLOWED_CAMPAIGN_IDS_IN_SECRET value in config/rules.yml is only a placeholder."
         )
 
     for rule in config.get("rules") or []:
