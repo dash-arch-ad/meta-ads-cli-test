@@ -135,6 +135,14 @@ def redact_text(value: Any) -> str:
     return text
 
 
+def env_bool(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
 def rule_public_summary(rule: dict[str, Any]) -> dict[str, Any]:
     allowed_keys = {
         "name",
@@ -1045,40 +1053,58 @@ def main() -> int:
         output["decision_counts"] = decision_counts
         output["matched_ads"] = matched_ads_summary
 
-        try:
-            ai_config = load_ai_config(PROJECT_ROOT / "config" / "ai_advisor.yml")
-            ai_input = build_ai_advisor_input(ads, config, ai_config, mode)
-            ai_result = run_ai_advisor(ai_input, ai_config)
-            ai_result["input_summary"] = {
-                "ads": len(ai_input.get("ads") or []),
-                "window": (ai_input.get("run_context") or {}).get("window"),
+        send_test_status = env_bool("META_SEND_TEST_STATUS", True)
+
+        if send_test_status:
+            try:
+                ai_config = load_ai_config(PROJECT_ROOT / "config" / "ai_advisor.yml")
+                ai_input = build_ai_advisor_input(ads, config, ai_config, mode)
+                ai_result = run_ai_advisor(ai_input, ai_config)
+                ai_result["input_summary"] = {
+                    "ads": len(ai_input.get("ads") or []),
+                    "window": (ai_input.get("run_context") or {}).get("window"),
+                }
+                ai_result["chatwork_message"] = build_ai_chatwork_message(ai_result, ai_config)
+                output["ai_advisor"] = ai_result
+            except Exception as exc:
+                output["ai_advisor"] = {
+                    "enabled": False,
+                    "provider": "gemini",
+                    "sent_to_model": False,
+                    "skipped": False,
+                    "error": redact_text(exc),
+                    "chatwork_message": "【配信テスト中】Meta広告 AI運用提案\n\n※AI提案生成失敗。停止・再開・バナー追加は自動実行していません。",
+                }
+
+            test_status_result = notify_chatwork(build_test_status_chatwork_message(output))
+            output["test_status_chatwork"] = {
+                "enabled": test_status_result.get("enabled", False),
+                "sent": test_status_result.get("sent", False),
+                "status": test_status_result.get("status"),
+                "error": test_status_result.get("error"),
+                "reason": test_status_result.get("reason"),
             }
-            ai_result["chatwork_message"] = build_ai_chatwork_message(ai_result, ai_config)
-            output["ai_advisor"] = ai_result
-        except Exception as exc:
+
+            if test_status_result.get("enabled") and not test_status_result.get("sent"):
+                output["errors"].append(
+                    "Chatwork test status notification failed: "
+                    f"{redact_text(test_status_result.get('error') or test_status_result.get('status'))}"
+                )
+
+        else:
             output["ai_advisor"] = {
-                "enabled": False,
+                "enabled": True,
                 "provider": "gemini",
                 "sent_to_model": False,
-                "skipped": False,
-                "error": redact_text(exc),
-                "chatwork_message": "【配信テスト中】Meta広告 AI運用提案\n\n※AI提案生成失敗。停止・再開・バナー追加は自動実行していません。",
+                "skipped": True,
+                "skip_reason": "META_SEND_TEST_STATUS is false; AI proposal runs only for manual status notifications.",
+                "chatwork_message": "",
             }
-
-        test_status_result = notify_chatwork(build_test_status_chatwork_message(output))
-        output["test_status_chatwork"] = {
-            "enabled": test_status_result.get("enabled", False),
-            "sent": test_status_result.get("sent", False),
-            "status": test_status_result.get("status"),
-            "error": test_status_result.get("error"),
-            "reason": test_status_result.get("reason"),
-        }
-
-        if test_status_result.get("enabled") and not test_status_result.get("sent"):
-            output["errors"].append(
-                "Chatwork test status notification failed: "
-                f"{redact_text(test_status_result.get('error') or test_status_result.get('status'))}"
-            )
+            output["test_status_chatwork"] = {
+                "enabled": False,
+                "sent": False,
+                "reason": "META_SEND_TEST_STATUS is false.",
+            }
 
         if mode == "active":
             for match in limited_matches:
