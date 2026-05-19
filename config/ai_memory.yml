@@ -1,0 +1,208 @@
+meta_ads_operation_philosophy:
+  version: "1.0"
+  purpose: >
+    Meta広告運用において、成果悪化時や改善判断時にAIが一貫した判断を行うための運用哲学。
+    個別業種の感覚論ではなく、Meta広告マネージャー上で確認できる数値、階層、配信状態、変更履歴をもとに判断する。
+
+  core_principle: >
+    Meta広告運用は、人間が細かく操作して勝つものではなく、
+    機械学習が正しく探索し、成果を出しやすい構造・母数・予算配分・判断ルールを整えるものである。
+    短期のCPA悪化だけで反応せず、階層、母数、学習状態、前段指標を確認してから判断する。
+
+  philosophies:
+    - id: "diagnose_from_upper_layer_act_from_lower_layer"
+      title: "成果悪化は上位階層から診断し、処置は下位階層から行う"
+      principle: >
+        成果が悪化したときは、いきなり広告を止めない。
+        まずキャンペーン全体、次に広告セット、最後に広告単位を見る。
+        原因診断は上位階層から行い、停止・差し替え・調整などの処置は下位階層から行う。
+      decision_order:
+        - "計測不備、CV API、ピクセル、LP障害、曜日要因などを確認する"
+        - "キャンペーン単位で、全体CPA、CV数、消化額、予算配分、目的設定を見る"
+        - "広告セット単位で、学習状態、配信量、オーディエンス、配置、フリークエンシーを見る"
+        - "広告単位で、CTR、CPC、CVR、CPA、消化額、CV数を見る"
+      ai_instruction: >
+        成果悪化の原因を広告単体に即断してはならない。
+        キャンペーン全体の悪化なのか、特定広告セットの悪化なのか、特定広告の疲弊なのかを分解して判断する。
+
+    - id: "stop_ads_by_target_cpa_multiplier"
+      title: "広告停止は固定金額ではなく、目標CPAの倍率で判断する"
+      principle: >
+        広告を止める基準は、固定の消化額ではなく目標CPAに対する倍率で判断する。
+        商材ごとに許容CPAが違うため、絶対額で停止基準を作ると判断が壊れる。
+      rules:
+        - condition: "CVが0件で、消化額が目標CPAの1.5倍以上"
+          action: "警戒対象にする"
+        - condition: "CVが0件で、消化額が目標CPAの2倍以上、かつCTRやCVRも悪い"
+          action: "停止候補にする"
+        - condition: "CVが0件でも、CTRやLP遷移率が良い"
+          action: "目標CPAの2倍から3倍程度までは観察を許容する"
+        - condition: "消化額が目標CPAの3倍以上で、CVが0件"
+          action: "原則停止する"
+        - condition: "CVが1件以上あるがCPAが悪い"
+          action: "3件から5件程度のCV母数が貯まるまでは即停止しない"
+      ai_instruction: >
+        CPAが高いという理由だけで広告を停止してはならない。
+        目標CPAに対する消化倍率、CV数、CTR、CVR、CPCを確認し、改善余地が薄い場合のみ停止候補とする。
+
+    - id: "do_not_judge_low_cv_by_cpa_only"
+      title: "CVが少ない時はCPAだけで判断しない"
+      principle: >
+        CV数が少ない状態ではCPAは大きくブレる。
+        CVが0件から3件程度の場合、CPAだけを主判断にして広告停止や予算調整を行ってはならない。
+      check_metrics:
+        - "CPM"
+        - "CTR"
+        - "リンクCTR"
+        - "CPC"
+        - "LPV率"
+        - "CVR"
+        - "消化額"
+        - "CV数"
+      ai_instruction: >
+        CVが少ない場合は、CPAではなくCPAを構成する前段指標を見る。
+        CTRが良いのにCVRが悪い場合はLPやオファーの問題を疑う。
+        CTRもCVRも悪い場合は広告訴求または配信対象の問題を疑う。
+
+    - id: "do_not_over_edit_during_learning"
+      title: "学習中は触らない。ただし学習が成立していない構造は直す"
+      principle: >
+        学習中の広告セットは、短期成果の悪化だけで頻繁に編集しない。
+        予算、ターゲット、入札、広告の大幅変更を繰り返すと、機械学習の探索を妨げる。
+      wait_conditions:
+        - "学習中で、消化額がまだ十分でない"
+        - "直近の大きな編集から十分な期間が経っていない"
+        - "CV数が少なく、CPAが統計的に不安定"
+      edit_conditions:
+        - "計測ミスがある"
+        - "明らかな設定ミスがある"
+        - "消化額が目標CPAの3倍以上でCVが0件"
+        - "配信先や年齢などが明らかに不適切"
+        - "予算が少なすぎて学習完了が現実的でない"
+      ai_instruction: >
+        学習中は、成果が悪いから触るのではなく、学習が成立していない場合だけ修正する。
+        判断に迷う場合は、停止や編集ではなく、観察継続または人間確認を提案する。
+
+    - id: "scale_budget_gradually"
+      title: "予算増額は勝ちに寄せるが、学習を壊さない速度で行う"
+      principle: >
+        成果の良い広告セットやキャンペーンには予算を寄せる。
+        ただし、急激な増額は配信学習やCPAを崩す可能性があるため、段階的に増額する。
+      lookback_period:
+        short_term: "直近3日"
+        standard: "直近7日"
+        long_term: "直近14日から28日。低CV案件や高単価案件で使用する"
+      scaling_rules:
+        - condition: "直近3日と7日のCPAが目標内で、CV数も十分"
+          action: "15%から20%程度の増額を検討する"
+        - condition: "成果が非常に安定している"
+          action: "20%から30%以内の増額を検討する"
+        - condition: "CPAは良いがCV数が1件から2件しかない"
+          action: "増額せず観察する"
+        - condition: "増額後にCPAが悪化した"
+          action: "追加増額を止め、原因を確認する"
+      ai_instruction: >
+        予算増額は、短期の1日成果だけで判断してはならない。
+        直近3日と7日の両方で成果が安定している場合のみ、段階的な増額を提案する。
+
+    - id: "decompose_cpa_into_ctr_cpc_cvr"
+      title: "CPA悪化はCTR低下・CPC上昇・CVR低下に分解して考える"
+      principle: >
+        CPAは結果指標であり、単体では原因が分からない。
+        CPAが悪化した場合は、CTR、CPC、CVRに分解して、クリック前の問題かクリック後の問題かを判断する。
+      priority:
+        - "CVR低下を最も重く見る"
+        - "CTR低下は広告疲弊や訴求ズレとして見る"
+        - "CPC上昇はCTR低下やCPM上昇の結果として見る"
+      interpretation:
+        ctr_down: "広告の反応が落ちている。クリエイティブ疲弊、訴求ズレ、配信対象ズレを疑う"
+        cpc_up: "クリック獲得効率が悪化している。CTR低下またはCPM上昇を確認する"
+        cvr_down: "クリック後の成果率が落ちている。LP、フォーム、価格、オファー、CV地点を疑う"
+      ai_instruction: >
+        CPA悪化時は、必ずCTR、CPC、CVRに分解する。
+        CTRが良いのにCVRが悪い場合、広告停止よりLPやオファー確認を優先する。
+        CTRもCVRも悪い場合、広告または配信対象の見直しを提案する。
+
+    - id: "breakdowns_are_for_diagnosis_not_over_restriction"
+      title: "内訳は切るためではなく、無駄打ちの原因を知るために見る"
+      principle: >
+        配置、年齢、性別、デバイスの内訳は、すぐ除外するためではなく、
+        どこで成果が悪化しているかを診断するために見る。
+        細かく除外しすぎると、Metaの機械学習の自由度を狭める。
+      exclusion_conditions:
+        - condition: "特定内訳で、目標CPAの2倍から3倍以上消化してCVが0件"
+          action: "除外候補にする"
+        - condition: "特定内訳で、CVが5件以上あり、CPAが全体平均の1.5倍から2倍以上"
+          action: "除外候補にする"
+        - condition: "特定内訳で、CTRもCVRも悪い"
+          action: "除外候補にする"
+      do_not_exclude_conditions:
+        - "配信量が少ない"
+        - "消化額が少ない"
+        - "CPAは高いがCVRは良い"
+        - "一時的な1日悪化にすぎない"
+      ai_instruction: >
+        内訳の成果差だけで即除外してはならない。
+        除外判断には、消化額、CV数、CPA、CTR、CVRの十分な根拠が必要である。
+
+    - id: "frequency_alone_is_not_fatigue"
+      title: "疲弊はFrequency単体ではなく、Frequency上昇と成果悪化の組み合わせで見る"
+      principle: >
+        フリークエンシーが高いだけでは広告疲弊とは判断しない。
+        疲弊とは、同じ広告が見られすぎた結果、反応率や成果が落ちている状態である。
+      fatigue_signals:
+        - "Frequency上昇かつCTR低下"
+        - "Frequency上昇かつCPA悪化"
+        - "Frequency上昇かつCVR低下"
+        - "Frequency上昇かつリーチ停滞"
+      frequency_guideline:
+        prospecting: "新規向け広範囲配信では、7日で2.5から3以上なら疲弊を疑う"
+        retargeting: "リターゲティングでは、7日で5から8以上なら疲弊を疑う"
+        small_audience: "小規模リストでは高Frequencyが起きやすいため、Frequency単体では判断しない"
+      ai_instruction: >
+        Frequencyが高くてもCPAやCTRが良ければ停止しない。
+        Frequency上昇とCTR低下、CPA悪化が同時に起きた場合、新規広告追加や広告差し替えを提案する。
+
+    - id: "add_new_ads_before_winners_decline"
+      title: "新規広告は負けた後ではなく、勝ち広告の限界が見えた時に追加する"
+      principle: >
+        新規広告は、既存広告が完全に悪化してから追加するものではない。
+        勝ち広告への配信集中、Frequency上昇、CTR低下が見えた段階で、次の広告を追加する。
+      add_conditions:
+        - condition: "上位1件から2件の広告に消化額が集中している"
+          action: "新規広告追加を提案する"
+        - condition: "上位広告の消化比率が70%以上"
+          action: "新規広告追加を提案する"
+        - condition: "Frequencyが上昇し、CTRが20%以上低下している"
+          action: "新規広告追加を提案する"
+        - condition: "CPAが20%から30%以上悪化している"
+          action: "新規広告追加または訴求入れ替えを提案する"
+        - condition: "CTRは良いがCVRが悪い"
+          action: "広告追加ではなく、LPやオファー確認を提案する"
+      ai_instruction: >
+        新規広告追加は敗戦処理ではなく、勝ち広告の寿命を延ばすための先行投資として扱う。
+        勝ち広告がまだ勝っているうちに、次の候補を追加する提案を行う。
+
+    - id: "automation_should_detect_not_decide_everything"
+      title: "AIと自動ルールは検知と提案に使い、構造変更と事業判断は人間が見る"
+      principle: >
+        AIや自動ルールは、異常検知、通知、軽微な処置、日次レポート生成に使う。
+        一方で、キャンペーン構造変更、予算の大幅変更、CV地点変更、LPやオファー判断は人間が確認する。
+      automation_allowed:
+        - "目標CPAの3倍以上消化してCVが0件の広告を通知する"
+        - "Frequency上昇とCTR低下を通知する"
+        - "消化額の急増を通知する"
+        - "CPA急騰を通知する"
+        - "日次レポートを生成する"
+        - "停止候補、増額候補、新規広告追加候補を提案する"
+      human_review_required:
+        - "キャンペーン構造変更"
+        - "広告セット統合"
+        - "大幅な予算増減"
+        - "配置、年齢、性別、デバイスの除外"
+        - "CV地点変更"
+        - "LP、価格、オファー、フォーム改善判断"
+        - "クリエイティブの意味や訴求内容の判断"
+      ai_instruction: >
+        AIは、原則として自動停止や自動構造変更を行わず、まず提案と警告を行う。
+        判断根拠となる数値、対象階層、推奨アクション、注意点をセットで出力する。
