@@ -22,7 +22,8 @@ free_tier_guardrails:
 objective: CPAを悪化させずCVを増やす
 
 thresholds:
-  target_cpa: 5000
+  target_cpa: null
+  target_cpa_source: unset
   min_spend_for_pause_review: 3000
   min_spend_for_creative_review: 2000
   min_conversions_for_keep: 1
