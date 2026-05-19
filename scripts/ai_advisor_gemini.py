@@ -461,6 +461,202 @@ def pause_review_min_spend_for_ad(ad: dict[str, Any], thresholds: dict[str, Any]
     return legacy_fixed_amount or 0.0
 
 
+def proposal_has_section_items(proposal: dict[str, Any]) -> bool:
+    for key in (
+        "pause_candidates",
+        "keep_candidates",
+        "resume_candidates",
+        "creative_suggestions",
+        "warnings",
+        "rule_change_suggestions",
+    ):
+        value = proposal.get(key)
+        if isinstance(value, list) and value:
+            return True
+    return False
+
+
+def status_is_active(ad: dict[str, Any]) -> bool:
+    return (
+        str(ad.get("configured_status") or "").upper() == "ACTIVE"
+        and str(ad.get("effective_status") or "").upper() == "ACTIVE"
+    )
+
+
+def status_is_not_active(ad: dict[str, Any]) -> bool:
+    return not status_is_active(ad)
+
+
+def ad_display_name(ad: dict[str, Any]) -> str:
+    return str(ad.get("ad_name") or ad.get("ad_ref") or "広告").strip()
+
+
+def target_cpa_for_ad(ad: dict[str, Any], rules: dict[str, Any]) -> float | None:
+    return positive_float(ad.get("adset_target_cpa")) or positive_float(rules.get("target_cpa"))
+
+
+def evidence_subset(fields: list[str], allowed_evidence: set[str]) -> list[str]:
+    return [field for field in fields if field in allowed_evidence][:6]
+
+
+def missing_subset(fields: list[str], missing_evidence: set[str]) -> list[str]:
+    return [field for field in fields if field in missing_evidence][:6]
+
+
+def enrich_empty_proposal(
+    clean: dict[str, Any],
+    ai_input: dict[str, Any],
+    config: dict[str, Any],
+    allowed_evidence: set[str],
+    missing_evidence: set[str],
+    validation_notes: list[str],
+) -> None:
+    if proposal_has_section_items(clean):
+        return
+
+    ads = [ad for ad in (ai_input.get("ads") or []) if isinstance(ad, dict)]
+    if not ads:
+        clean["warnings"].append(
+            {
+                "type": "data_empty",
+                "message": "AI判定用の広告データがありません。対象キャンペーンや取得条件を確認してください。",
+            }
+        )
+        validation_notes.append("fallback: no_ads")
+        return
+
+    thresholds = config.get("thresholds") or {}
+    rules = ai_input.get("rules") or {}
+    active_ads = [ad for ad in ads if status_is_active(ad)]
+    inactive_ads = [ad for ad in ads if status_is_not_active(ad)]
+    min_keep_conversions = int(float(thresholds.get("min_conversions_for_keep", 1) or 1))
+    min_scale_conversions = int(float(thresholds.get("min_conversions_for_scale_review", 2) or 2))
+
+    if not clean.get("summary"):
+        clean["summary"] = "AI候補が空のため、取得済み数値から判断保留点を補足します。"
+    else:
+        clean["summary"] = f"{clean['summary']} 数値ベースの補足を追加します。"
+
+    for ad in sorted(active_ads, key=lambda item: -float(item.get("spend") or 0))[:2]:
+        spend = float(ad.get("spend") or 0)
+        conversions = float(ad.get("conversions") or 0)
+        target_cpa = target_cpa_for_ad(ad, rules)
+        pause_watch_multiplier = positive_float(rules.get("pause_watch_target_cpa_multiplier")) or 1.5
+        pause_review_multiplier = positive_float(rules.get("pause_review_target_cpa_multiplier")) or 2.0
+        evidence = evidence_subset(
+            ["configured_status", "effective_status", "spend", "conversions", "cpa", "adset_target_cpa", "ctr", "cvr"],
+            allowed_evidence,
+        )
+        missing = missing_subset(["learning_status", "change_history"], missing_evidence)
+
+        if conversions >= min_keep_conversions:
+            reason = "CV実績があるため、CPAと前段指標を見ながら観察継続。"
+            confidence = "medium"
+        elif target_cpa is not None and spend < target_cpa * pause_watch_multiplier:
+            reason = "消化額が目標CPAの警戒倍率未満のため、停止判断はまだ早い。"
+            confidence = "high"
+        elif target_cpa is not None and spend < target_cpa * pause_review_multiplier:
+            reason = "CVはないが停止検討倍率未満のため、前段指標を確認して観察。"
+            confidence = "medium"
+        else:
+            reason = "停止候補には未分類。CTR、CVR、計測状態を確認して判断保留。"
+            confidence = "low"
+
+        clean["keep_candidates"].append(
+            {
+                "ad_ref": ad.get("ad_ref"),
+                "ad_name": ad.get("ad_name") or "",
+                "campaign_name": ad.get("campaign_name") or "",
+                "campaign_ref": ad.get("campaign_ref") or "",
+                "priority": "medium",
+                "reason": reason,
+                "recommended_action": "watch",
+                "confidence": confidence,
+                "evidence_fields": evidence,
+                "missing_fields": missing,
+            }
+        )
+
+    stopped_with_cv = [
+        ad
+        for ad in inactive_ads
+        if float(ad.get("conversions") or 0) >= min_keep_conversions
+    ]
+    for ad in sorted(stopped_with_cv, key=lambda item: -float(item.get("conversions") or 0))[:2]:
+        conversions = float(ad.get("conversions") or 0)
+        cpa = positive_float(ad.get("cpa"))
+        target_cpa = target_cpa_for_ad(ad, rules)
+        priority = "medium"
+        confidence = "medium"
+        if conversions >= min_scale_conversions:
+            priority = "high"
+        if target_cpa is not None and cpa is not None and cpa > target_cpa:
+            priority = "medium"
+            confidence = "low"
+
+        clean["resume_candidates"].append(
+            {
+                "ad_ref": ad.get("ad_ref"),
+                "ad_name": ad.get("ad_name") or "",
+                "campaign_name": ad.get("campaign_name") or "",
+                "campaign_ref": ad.get("campaign_ref") or "",
+                "priority": priority,
+                "reason": "停止中だがCV実績あり。上位階層の停止理由を確認して再開テスト検討。",
+                "recommended_action": "resume_test_review",
+                "confidence": confidence,
+                "evidence_fields": evidence_subset(
+                    ["configured_status", "effective_status", "conversions", "cpa", "spend", "adset_target_cpa"],
+                    allowed_evidence,
+                ),
+                "missing_fields": missing_subset(["learning_status", "change_history"], missing_evidence),
+            }
+        )
+
+    if inactive_ads:
+        clean["warnings"].append(
+            {
+                "type": "delivery_state",
+                "message": f"取得{len(ads)}件中{len(inactive_ads)}件が停止中です。現役評価と再開検討を分けて見てください。",
+            }
+        )
+
+    if "learning_status" in missing_evidence or "change_history" in missing_evidence:
+        clean["warnings"].append(
+            {
+                "type": "pending_judgment",
+                "message": "学習状態と変更履歴が未取得のため、停止・再開は人間確認前提です。",
+            }
+        )
+
+    if "creative_text" in missing_evidence or "creative_image" in missing_evidence:
+        clean["creative_suggestions"].append(
+            {
+                "theme": "勝ち広告の実物確認",
+                "message": "画像・テキストを取得して、CTR低下やCVR低下の原因を確認する。",
+                "reason": "現在はクリエイティブ実物が未取得で、訴求内容を断定できません。",
+                "priority": "medium",
+                "recommended_action": "creative_test_review",
+                "evidence_fields": evidence_subset(["ctr", "cvr", "spend", "conversions"], allowed_evidence),
+                "missing_fields": missing_subset(["creative_text", "creative_image"], missing_evidence),
+            }
+        )
+
+    if rules.get("target_cpa_source") != "unset" and rules.get("pause_review_target_cpa_multiplier"):
+        clean["rule_change_suggestions"].append(
+            {
+                "rule_name": "ai_pause_review_basis",
+                "suggested_change": "AI提案は固定金額ではなくMeta目標CPA倍率で判断し続ける。",
+                "reason": "広告セットごとの目標CPA差を反映でき、二重管理を減らせます。",
+                "risk": "low",
+                "approval_required": True,
+                "evidence_fields": evidence_subset(["adset_target_cpa", "spend", "conversions"], allowed_evidence),
+                "missing_fields": [],
+            }
+        )
+
+    validation_notes.append("fallback: enriched_empty_ai_proposal")
+
+
 def validate_proposal(
     proposal: dict[str, Any],
     ai_input: dict[str, Any],
@@ -566,6 +762,14 @@ def validate_proposal(
         allowed_evidence,
         missing_evidence,
         rules.get("target_cpa_source") != "unset",
+    )
+    enrich_empty_proposal(
+        clean,
+        ai_input,
+        config,
+        allowed_evidence,
+        missing_evidence,
+        validation_notes,
     )
 
     return clean, validation_notes
