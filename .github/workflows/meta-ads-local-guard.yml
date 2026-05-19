@@ -19,6 +19,7 @@ jobs:
       CHATWORK_ROOM_ID: ${{ secrets.CHATWORK_ROOM_ID }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-2.5-flash
+      META_SEND_TEST_STATUS: ${{ github.event_name == 'workflow_dispatch' }}
 
     steps:
       - name: Checkout
