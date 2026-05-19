@@ -36,6 +36,7 @@ FORBIDDEN_ACTIONS = {
 
 VALID_PRIORITIES = {"high", "medium", "low", "reference"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
+VALID_RISKS = {"high", "medium", "low"}
 
 
 AD_DECISION_SCHEMA: dict[str, Any] = {
@@ -93,6 +94,27 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
                 "required": ["type", "message"],
             },
         },
+        "rule_change_suggestions": {
+            "type": "array",
+            "maxItems": 3,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "rule_name": {"type": "string"},
+                    "suggested_change": {"type": "string"},
+                    "reason": {"type": "string"},
+                    "risk": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "approval_required": {"type": "boolean"},
+                },
+                "required": [
+                    "rule_name",
+                    "suggested_change",
+                    "reason",
+                    "risk",
+                    "approval_required",
+                ],
+            },
+        },
     },
     "required": [
         "summary",
@@ -101,6 +123,7 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
         "resume_candidates",
         "creative_suggestions",
         "warnings",
+        "rule_change_suggestions",
     ],
 }
 
@@ -116,6 +139,22 @@ def load_ai_config(path: Path) -> dict[str, Any]:
         raise ValueError("AI advisor config root must be a mapping.")
 
     return config
+
+
+def load_ai_memory(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
+    if not path.exists():
+        return None, [f"ai_memory_not_found:{path}"]
+
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            memory = yaml.safe_load(fh) or {}
+    except Exception as exc:
+        return None, [f"ai_memory_load_failed:{exc}"]
+
+    if not isinstance(memory, dict):
+        return None, ["ai_memory_root_not_mapping"]
+
+    return memory, []
 
 
 def advisor_enabled(config: dict[str, Any]) -> bool:
@@ -135,8 +174,10 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
                 "You are an ad-operations advisor. Propose only; never execute changes.",
                 "Allowed actions: pause_review, keep, watch, resume_test_review, creative_test_review, measurement_check, lp_check.",
                 "Forbidden actions: pause_now, resume_now, increase_budget_now, create_ad_now, change_campaign_now.",
-                "Use these exact keys: summary, pause_candidates, keep_candidates, resume_candidates, creative_suggestions, warnings.",
+                "Use these exact keys: summary, pause_candidates, keep_candidates, resume_candidates, creative_suggestions, warnings, rule_change_suggestions.",
                 "All arrays must have at most 2 items. Keep Japanese text short.",
+                "Use operation_philosophy as the senior policy, but do not override safety guards or forbidden actions.",
+                "rule_change_suggestions are suggestions only and must require approval.",
                 "Data:",
                 json.dumps(ai_input, ensure_ascii=False, separators=(",", ":")),
             ]
@@ -156,6 +197,8 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
             "",
             "Rules:",
             "- Write Japanese values.",
+            "- Treat operation_philosophy as the operator's senior policy memory.",
+            "- Do not let operation_philosophy override safety guards or forbidden actions.",
             "- summary <= 80 Japanese chars.",
             "- each array <= 3 items.",
             "- reason/message <= 60 Japanese chars.",
@@ -163,6 +206,8 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
             "- If an ad has conversions, be cautious about pause review.",
             "- Put measurement or pending-judgment issues in warnings.",
             "- Creative ideas are message themes only, not execution instructions.",
+            "- rule_change_suggestions are proposal-only. Never imply automatic application.",
+            "- Set approval_required=true for every rule_change_suggestion.",
             "",
             "Data:",
             json.dumps(ai_input, ensure_ascii=False, separators=(",", ":")),
@@ -314,6 +359,7 @@ def validate_proposal(
         "resume_candidates": [],
         "creative_suggestions": [],
         "warnings": [],
+        "rule_change_suggestions": [],
     }
 
     for section, expected_actions in (
@@ -371,6 +417,10 @@ def validate_proposal(
         proposal.get("creative_suggestions") or []
     )
     clean["warnings"].extend(clean_warnings(proposal.get("warnings") or []))
+    clean["rule_change_suggestions"] = clean_rule_change_suggestions(
+        proposal.get("rule_change_suggestions") or [],
+        validation_notes,
+    )
 
     return clean, validation_notes
 
@@ -448,6 +498,45 @@ def clean_warnings(items: Any) -> list[dict[str, str]]:
             continue
 
         clean.append({"type": warning_type, "message": message})
+
+    return clean
+
+
+def clean_rule_change_suggestions(
+    items: Any,
+    validation_notes: list[str],
+) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        validation_notes.append("rule_change_suggestions: not_list")
+        return []
+
+    clean: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            validation_notes.append("rule_change_suggestions: invalid_item")
+            continue
+
+        rule_name = str(item.get("rule_name") or "").strip()
+        suggested_change = str(item.get("suggested_change") or "").strip()
+        reason = str(item.get("reason") or "").strip()
+        risk = str(item.get("risk") or "medium").strip()
+
+        if not rule_name or not suggested_change or not reason:
+            validation_notes.append("rule_change_suggestions: missing_required_field")
+            continue
+
+        if risk not in VALID_RISKS:
+            risk = "medium"
+
+        clean.append(
+            {
+                "rule_name": rule_name,
+                "suggested_change": suggested_change,
+                "reason": reason,
+                "risk": risk,
+                "approval_required": True,
+            }
+        )
 
     return clean
 
@@ -611,6 +700,7 @@ def build_chatwork_message(result: dict[str, Any], config: dict[str, Any]) -> st
         append_creative_section(lines, proposal.get("creative_suggestions") or [], max_items)
 
     append_warning_section(lines, proposal.get("warnings") or [], max_items)
+    append_rule_change_section(lines, proposal.get("rule_change_suggestions") or [], max_items)
 
     return "\n".join(lines).rstrip()
 
@@ -681,3 +771,26 @@ def append_warning_section(
 
     for item in items[:max_items]:
         lines.append(f"- {item.get('type') or 'notice'}: {item.get('message') or '-'}")
+
+
+def append_rule_change_section(
+    lines: list[str],
+    items: list[dict[str, Any]],
+    max_items: int,
+) -> None:
+    lines.append("")
+    lines.append("■ ルール改善案")
+    if not items:
+        lines.append("-")
+        return
+
+    for item in items[:max_items]:
+        lines.extend(
+            [
+                f"- {item.get('rule_name') or '-'}",
+                f"  変更案: {item.get('suggested_change') or '-'}",
+                f"  理由: {item.get('reason') or '-'}",
+                f"  リスク: {item.get('risk') or '-'}",
+                "  承認: 人間確認が必要",
+            ]
+        )

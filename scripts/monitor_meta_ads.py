@@ -20,6 +20,7 @@ import yaml
 from ai_advisor_gemini import (
     build_chatwork_message as build_ai_chatwork_message,
     load_ai_config,
+    load_ai_memory,
     run_ai_advisor,
 )
 
@@ -1059,11 +1060,20 @@ def main() -> int:
             try:
                 ai_config = load_ai_config(PROJECT_ROOT / "config" / "ai_advisor.yml")
                 ai_input = build_ai_advisor_input(ads, config, ai_config, mode)
+                ai_memory, ai_memory_notes = load_ai_memory(PROJECT_ROOT / "config" / "ai_memory.yml")
+                if ai_memory:
+                    ai_input["operation_philosophy"] = ai_memory
                 ai_result = run_ai_advisor(ai_input, ai_config)
                 ai_result["input_summary"] = {
                     "ads": len(ai_input.get("ads") or []),
                     "window": (ai_input.get("run_context") or {}).get("window"),
+                    "operation_philosophy_loaded": bool(ai_memory),
                 }
+                if ai_memory_notes:
+                    ai_result["validation_notes"] = [
+                        *(ai_result.get("validation_notes") or []),
+                        *ai_memory_notes,
+                    ]
                 ai_result["chatwork_message"] = build_ai_chatwork_message(ai_result, ai_config)
                 output["ai_advisor"] = ai_result
             except Exception as exc:
