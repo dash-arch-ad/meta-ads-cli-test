@@ -10,6 +10,7 @@ max_gemini_calls_per_run: 2
 retry_on_invalid_json: true
 retry_on_transient_api_error: true
 retry_delay_seconds: 5
+use_response_schema: false
 
 free_tier_guardrails:
   expected_runs_per_day: 48
