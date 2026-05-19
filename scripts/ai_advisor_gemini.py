@@ -66,8 +66,26 @@ AD_DECISION_SCHEMA: dict[str, Any] = {
             ],
         },
         "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+        "evidence_fields": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string"},
+        },
+        "missing_fields": {
+            "type": "array",
+            "maxItems": 6,
+            "items": {"type": "string"},
+        },
     },
-    "required": ["ad_ref", "priority", "reason", "recommended_action", "confidence"],
+    "required": [
+        "ad_ref",
+        "priority",
+        "reason",
+        "recommended_action",
+        "confidence",
+        "evidence_fields",
+        "missing_fields",
+    ],
 }
 
 ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
@@ -87,8 +105,18 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
                     "message": {"type": "string"},
                     "reason": {"type": "string"},
                     "priority": {"type": "string", "enum": ["high", "medium", "low"]},
+                    "evidence_fields": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
+                    "missing_fields": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
                 },
-                "required": ["theme", "message", "reason", "priority"],
+                "required": ["theme", "message", "reason", "priority", "evidence_fields", "missing_fields"],
             },
         },
         "warnings": {
@@ -114,6 +142,16 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
                     "reason": {"type": "string"},
                     "risk": {"type": "string", "enum": ["high", "medium", "low"]},
                     "approval_required": {"type": "boolean"},
+                    "evidence_fields": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
+                    "missing_fields": {
+                        "type": "array",
+                        "maxItems": 6,
+                        "items": {"type": "string"},
+                    },
                 },
                 "required": [
                     "rule_name",
@@ -121,6 +159,8 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
                     "reason",
                     "risk",
                     "approval_required",
+                    "evidence_fields",
+                    "missing_fields",
                 ],
             },
         },
@@ -185,8 +225,10 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
                 "Forbidden actions: pause_now, resume_now, increase_budget_now, create_ad_now, change_campaign_now.",
                 "Use these exact keys: summary, pause_candidates, keep_candidates, resume_candidates, creative_suggestions, warnings, rule_change_suggestions.",
                 "All arrays must have at most 2 items. Keep Japanese text short.",
+                "For each ad or creative item include evidence_fields and missing_fields arrays.",
                 "Use operation_philosophy as the senior policy, but do not override safety guards or forbidden actions.",
                 "rule_change_suggestions are suggestions only and must require approval.",
+                "Use only data_contract.allowed_evidence. Never infer from missing_evidence or ad names.",
                 "Data:",
                 json.dumps(ai_input, ensure_ascii=False, separators=(",", ":")),
             ]
@@ -208,13 +250,18 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
             "- Write Japanese values.",
             "- Treat operation_philosophy as the operator's senior policy memory.",
             "- Do not let operation_philosophy override safety guards or forbidden actions.",
+            "- Use only fields listed in data_contract.allowed_evidence as evidence.",
+            "- Never infer demographics, targeting, offer, LP content, or creative content from ad_name/campaign_name.",
+            "- If needed evidence is listed in data_contract.missing_evidence, say it is missing.",
+            "- Each candidate must include evidence_fields and missing_fields.",
+            "- If rules.target_cpa_source is not configured, do not compare against a target CPA or suggest a target CPA amount.",
             "- summary <= 80 Japanese chars.",
             "- each array <= 3 items.",
             "- reason/message <= 60 Japanese chars.",
             "- Do not put low-spend ads in pause_candidates.",
             "- If an ad has conversions, be cautious about pause review.",
             "- Put measurement or pending-judgment issues in warnings.",
-            "- Creative ideas are message themes only, not execution instructions.",
+            "- creative_suggestions are creative review points only. Do not write concrete banner copy unless creative_text or creative_image is provided.",
             "- rule_change_suggestions are proposal-only. Never imply automatic application.",
             "- Set approval_required=true for every rule_change_suggestion.",
             "",
@@ -354,6 +401,40 @@ def parse_json_object_text(text: str) -> dict[str, Any]:
     return payload
 
 
+def clean_field_list(value: Any, allowed_values: set[str] | None = None, max_items: int = 6) -> list[str]:
+    if not isinstance(value, list):
+        return []
+
+    fields: list[str] = []
+    for item in value:
+        field = str(item or "").strip()
+        if not field:
+            continue
+        if allowed_values is not None and field not in allowed_values:
+            continue
+        if field not in fields:
+            fields.append(field)
+        if len(fields) >= max_items:
+            break
+
+    return fields
+
+
+def evidence_contract(ai_input: dict[str, Any]) -> tuple[set[str], set[str]]:
+    contract = ai_input.get("data_contract") or {}
+    allowed = {
+        str(item)
+        for item in (contract.get("allowed_evidence") or [])
+        if str(item).strip()
+    }
+    missing = {
+        str(item)
+        for item in (contract.get("missing_evidence") or [])
+        if str(item).strip()
+    }
+    return allowed, missing
+
+
 def validate_proposal(
     proposal: dict[str, Any],
     ai_input: dict[str, Any],
@@ -362,6 +443,8 @@ def validate_proposal(
     ads = ai_input.get("ads") or []
     ad_by_ref = {str(ad.get("ad_ref")): ad for ad in ads if ad.get("ad_ref")}
     thresholds = config.get("thresholds") or {}
+    rules = ai_input.get("rules") or {}
+    allowed_evidence, missing_evidence = evidence_contract(ai_input)
     min_pause_spend = float(thresholds.get("min_spend_for_pause_review", 0) or 0)
     validation_notes: list[str] = []
 
@@ -406,6 +489,21 @@ def validate_proposal(
             normalized["ad_name"] = str(ad.get("ad_name") or "").strip()
             normalized["campaign_name"] = str(ad.get("campaign_name") or "").strip()
             normalized["campaign_ref"] = str(ad.get("campaign_ref") or "").strip()
+            normalized["evidence_fields"] = clean_field_list(
+                normalized.get("evidence_fields"),
+                allowed_evidence,
+            )
+            normalized["missing_fields"] = clean_field_list(
+                normalized.get("missing_fields"),
+                missing_evidence,
+            )
+
+            if not normalized["evidence_fields"]:
+                normalized["evidence_fields"] = ["spend", "conversions"]
+                validation_notes.append(f"{section}: empty_evidence_fields:{ad_ref}")
+
+            if rules.get("target_cpa_source") != "configured" and "target_cpa" not in normalized["missing_fields"]:
+                normalized["missing_fields"].append("target_cpa")
 
             if section == "pause_candidates":
                 spend = float(ad.get("spend") or 0)
@@ -431,12 +529,17 @@ def validate_proposal(
             clean[section].append(normalized)
 
     clean["creative_suggestions"] = clean_creative_suggestions(
-        proposal.get("creative_suggestions") or []
+        proposal.get("creative_suggestions") or [],
+        allowed_evidence,
+        missing_evidence,
     )
     clean["warnings"].extend(clean_warnings(proposal.get("warnings") or []))
     clean["rule_change_suggestions"] = clean_rule_change_suggestions(
         proposal.get("rule_change_suggestions") or [],
         validation_notes,
+        allowed_evidence,
+        missing_evidence,
+        rules.get("target_cpa_source") == "configured",
     )
 
     return clean, validation_notes
@@ -465,10 +568,16 @@ def normalize_decision_item(item: Any) -> dict[str, Any] | None:
         "reason": reason,
         "recommended_action": action,
         "confidence": confidence,
+        "evidence_fields": item.get("evidence_fields") or [],
+        "missing_fields": item.get("missing_fields") or [],
     }
 
 
-def clean_creative_suggestions(items: Any) -> list[dict[str, Any]]:
+def clean_creative_suggestions(
+    items: Any,
+    allowed_evidence: set[str],
+    missing_evidence: set[str],
+) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         return []
 
@@ -487,6 +596,11 @@ def clean_creative_suggestions(items: Any) -> list[dict[str, Any]]:
         if priority not in {"high", "medium", "low"}:
             priority = "medium"
 
+        missing_fields = clean_field_list(item.get("missing_fields"), missing_evidence)
+        for field in ("creative_text", "creative_image"):
+            if field in missing_evidence and field not in missing_fields:
+                missing_fields.append(field)
+
         clean.append(
             {
                 "theme": theme,
@@ -494,6 +608,8 @@ def clean_creative_suggestions(items: Any) -> list[dict[str, Any]]:
                 "reason": reason,
                 "priority": priority,
                 "recommended_action": "creative_test_review",
+                "evidence_fields": clean_field_list(item.get("evidence_fields"), allowed_evidence),
+                "missing_fields": missing_fields[:6],
             }
         )
 
@@ -522,6 +638,9 @@ def clean_warnings(items: Any) -> list[dict[str, str]]:
 def clean_rule_change_suggestions(
     items: Any,
     validation_notes: list[str],
+    allowed_evidence: set[str],
+    missing_evidence: set[str],
+    target_cpa_configured: bool,
 ) -> list[dict[str, Any]]:
     if not isinstance(items, list):
         validation_notes.append("rule_change_suggestions: not_list")
@@ -542,6 +661,17 @@ def clean_rule_change_suggestions(
             validation_notes.append("rule_change_suggestions: missing_required_field")
             continue
 
+        target_cpa_text = f"{rule_name} {suggested_change} {reason}".lower()
+        if not target_cpa_configured and (
+            rule_name.lower() == "target_cpa"
+            or "目標cpaを" in target_cpa_text
+            or "target_cpaを" in target_cpa_text
+            or "5000" in target_cpa_text
+            or "5,000" in target_cpa_text
+        ):
+            validation_notes.append("rule_change_suggestions: rejected_target_cpa_without_config")
+            continue
+
         if risk not in VALID_RISKS:
             risk = "medium"
 
@@ -552,6 +682,8 @@ def clean_rule_change_suggestions(
                 "reason": reason,
                 "risk": risk,
                 "approval_required": True,
+                "evidence_fields": clean_field_list(item.get("evidence_fields"), allowed_evidence),
+                "missing_fields": clean_field_list(item.get("missing_fields"), missing_evidence),
             }
         )
 
@@ -787,6 +919,8 @@ def append_decision_section(
                 f"  理由: {item.get('reason') or '-'}",
                 f"  優先度: {priority}",
                 f"  確信度: {confidence}",
+                f"  根拠データ: {format_field_list(item.get('evidence_fields'))}",
+                f"  未取得データ: {format_field_list(item.get('missing_fields'))}",
             ]
         )
         if item.get("guard_warning"):
@@ -800,7 +934,7 @@ def append_creative_section(
     items: list[dict[str, Any]],
     max_items: int,
 ) -> None:
-    lines.append("■ 新規バナー案")
+    lines.append("■ クリエイティブ確認観点")
     if not items:
         lines.extend(["-", ""])
         return
@@ -809,9 +943,11 @@ def append_creative_section(
         lines.extend(
             [
                 f"- {item.get('theme') or '-'}",
-                f"  メッセージ: {item.get('message') or '-'}",
+                f"  確認観点: {item.get('message') or '-'}",
                 f"  理由: {item.get('reason') or '-'}",
                 f"  優先度: {item.get('priority') or '-'}",
+                f"  根拠データ: {format_field_list(item.get('evidence_fields'))}",
+                f"  未取得データ: {format_field_list(item.get('missing_fields'))}",
             ]
         )
 
@@ -850,6 +986,15 @@ def append_rule_change_section(
                 f"  変更案: {item.get('suggested_change') or '-'}",
                 f"  理由: {item.get('reason') or '-'}",
                 f"  リスク: {item.get('risk') or '-'}",
+                f"  根拠データ: {format_field_list(item.get('evidence_fields'))}",
+                f"  未取得データ: {format_field_list(item.get('missing_fields'))}",
                 "  承認: 人間確認が必要",
             ]
         )
+
+
+def format_field_list(value: Any) -> str:
+    if not isinstance(value, list) or not value:
+        return "-"
+
+    return ", ".join(str(item) for item in value if str(item).strip()) or "-"

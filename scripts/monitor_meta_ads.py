@@ -33,7 +33,8 @@ ACTIVE_STATUS = "ACTIVE"
 PAUSED_STATUS = "PAUSED"
 SENSITIVE_ENV_HINTS = ("TOKEN", "SECRET", "PASSWORD", "API_KEY")
 DEFAULT_INSIGHTS_FIELDS = (
-    "ad_id,ad_name,campaign_id,campaign_name,spend,impressions,clicks,ctr,cpc,"
+    "ad_id,ad_name,adset_id,adset_name,campaign_id,campaign_name,spend,impressions,"
+    "clicks,inline_link_clicks,ctr,inline_link_click_ctr,cpc,cpm,reach,frequency,"
     "conversions,actions,date_start,date_stop"
 )
 
@@ -92,6 +93,10 @@ def public_ad_ref(ad_id: Any) -> str:
 
 def public_campaign_ref(campaign_id: Any) -> str:
     return f"campaign_{short_hash(campaign_id)}"
+
+
+def public_adset_ref(adset_id: Any) -> str:
+    return f"adset_{short_hash(adset_id)}"
 
 
 def secret_values() -> list[str]:
@@ -390,6 +395,25 @@ def action_value(actions: list[dict[str, Any]], conversion_event: str) -> float 
     return total if found else None
 
 
+def action_value_by_types(actions: list[dict[str, Any]], action_types: set[str]) -> float | None:
+    total = 0.0
+    found = False
+
+    for action in actions:
+        action_type = str(
+            action.get("action_type")
+            or action.get("type")
+            or action.get("name")
+            or ""
+        )
+
+        if action_type in action_types:
+            total += number(action.get("value") or action.get("count"))
+            found = True
+
+    return total if found else None
+
+
 def conversions_from_ad(ad: dict[str, Any], conversion_event: str) -> float:
     action_sources: list[dict[str, Any]] = []
 
@@ -669,6 +693,39 @@ def ai_rule_decision(ad: dict[str, Any], config: dict[str, Any]) -> str:
     return first_not_matched_decision or "not_matched"
 
 
+def value_or_none(value: Any, digits: int = 2) -> float | None:
+    if value is None or value == "":
+        return None
+
+    return round(number(value), digits)
+
+
+def compact_operation_philosophy(memory: dict[str, Any], max_items: int = 10) -> dict[str, Any]:
+    root = memory.get("meta_ads_operation_philosophy")
+    if not isinstance(root, dict):
+        return memory
+
+    compact: dict[str, Any] = {
+        "version": root.get("version"),
+        "core_principle": root.get("core_principle"),
+        "philosophies": [],
+    }
+
+    for item in (root.get("philosophies") or [])[:max_items]:
+        if not isinstance(item, dict):
+            continue
+
+        compact["philosophies"].append(
+            {
+                "id": item.get("id"),
+                "title": item.get("title"),
+                "ai_instruction": item.get("ai_instruction"),
+            }
+        )
+
+    return {"meta_ads_operation_philosophy": compact}
+
+
 def build_ai_advisor_input(
     ads: list[dict[str, Any]],
     guard_config: dict[str, Any],
@@ -680,6 +737,8 @@ def build_ai_advisor_input(
     thresholds = ai_config.get("thresholds") or {}
     window = allowed_graph_date_preset(insights_window(guard_config))
     max_ads = int(ai_config.get("max_ads", 12) or 12)
+    target_cpa_source = str(thresholds.get("target_cpa_source") or "unset")
+    target_cpa = thresholds.get("target_cpa") if target_cpa_source == "configured" else None
 
     ai_ads: list[dict[str, Any]] = []
 
@@ -693,11 +752,27 @@ def build_ai_advisor_input(
         conversions = float(ad["conversions"])
         impressions = number(ad.get("impressions"))
         clicks = number(ad.get("clicks") or ad.get("inline_link_clicks"))
+        inline_link_clicks = number(ad.get("inline_link_clicks"))
+        action_sources: list[dict[str, Any]] = []
+        for key in ("actions", "conversions"):
+            action_sources.extend(parse_action_list(ad.get(key)))
+        lpv = action_value_by_types(
+            action_sources,
+            {
+                "landing_page_view",
+                "omni_landing_page_view",
+                "offsite_conversion.fb_pixel_landing_page_view",
+            },
+        )
         ctr = rounded(ad.get("ctr"))
         cpc = rounded(ad.get("cpc"))
+        inline_link_click_ctr = rounded(ad.get("inline_link_click_ctr"))
 
         if ctr is None:
             ctr = safe_rate(clicks, impressions)
+
+        if inline_link_click_ctr is None:
+            inline_link_click_ctr = safe_rate(inline_link_clicks, impressions)
 
         if cpc is None and clicks > 0:
             cpc = round(spend / clicks, 2)
@@ -707,6 +782,8 @@ def build_ai_advisor_input(
                 "ad_ref": public_ad_ref(ad["ad_id"]),
                 "campaign_ref": public_campaign_ref(ad["campaign_id"]),
                 "ad_name": str(ad.get("ad_name") or ""),
+                "adset_ref": public_adset_ref(ad.get("adset_id")) if ad.get("adset_id") else "",
+                "adset_name": str(ad.get("adset_name") or ""),
                 "campaign_name": str(ad.get("campaign_name") or ""),
                 "configured_status": ad.get("configured_status") or "",
                 "effective_status": ad.get("effective_status") or "",
@@ -715,6 +792,13 @@ def build_ai_advisor_input(
                 "cpa": round(ad["cpa"], 2) if ad.get("cpa") is not None else None,
                 "ctr": ctr,
                 "cpc": cpc,
+                "cpm": value_or_none(ad.get("cpm")),
+                "reach": value_or_none(ad.get("reach"), digits=0),
+                "frequency": value_or_none(ad.get("frequency")),
+                "inline_link_clicks": round(inline_link_clicks, 2),
+                "inline_link_click_ctr": inline_link_click_ctr,
+                "landing_page_views": round(lpv, 2) if lpv is not None else None,
+                "lpv_rate": safe_rate(float(lpv or 0), inline_link_clicks) if lpv is not None else None,
                 "cvr": safe_rate(conversions, clicks),
                 "rule_decision": ai_rule_decision(ad, guard_config),
             }
@@ -729,6 +813,45 @@ def build_ai_advisor_input(
     )[:max_ads]
 
     return {
+        "data_contract": {
+            "allowed_evidence": [
+                "ad_name",
+                "campaign_name",
+                "adset_name",
+                "configured_status",
+                "effective_status",
+                "spend",
+                "conversions",
+                "cpa",
+                "ctr",
+                "cpc",
+                "cpm",
+                "reach",
+                "frequency",
+                "inline_link_clicks",
+                "inline_link_click_ctr",
+                "landing_page_views",
+                "lpv_rate",
+                "cvr",
+                "rule_decision",
+            ],
+            "missing_evidence": [
+                "learning_status",
+                "change_history",
+                "placement_breakdown",
+                "age_breakdown",
+                "gender_breakdown",
+                "device_breakdown",
+                "creative_text",
+                "creative_image",
+                "lp_content",
+                "campaign_level_summary",
+                "adset_level_summary",
+                "lookback_3d_7d_14d_28d",
+                *(["target_cpa"] if target_cpa is None else []),
+            ],
+            "instruction": "allowed_evidenceにない情報を根拠に断定しない。広告名から年齢、性別、訴求、LP内容を推測しない。",
+        },
         "run_context": {
             "mode": mode,
             "window": window,
@@ -736,7 +859,8 @@ def build_ai_advisor_input(
             "notice": "AIは提案のみ。実行はしない。",
         },
         "rules": {
-            "target_cpa": thresholds.get("target_cpa"),
+            "target_cpa": target_cpa,
+            "target_cpa_source": target_cpa_source,
             "min_spend_for_pause_review": thresholds.get("min_spend_for_pause_review"),
             "min_conversions_for_scale_review": thresholds.get("min_conversions_for_scale_review"),
         },
@@ -1064,7 +1188,7 @@ def main() -> int:
                 ai_input = build_ai_advisor_input(ads, config, ai_config, mode)
                 ai_memory, ai_memory_notes = load_ai_memory(PROJECT_ROOT / "config" / "ai_memory.yml")
                 if ai_memory:
-                    ai_input["operation_philosophy"] = ai_memory
+                    ai_input["operation_philosophy"] = compact_operation_philosophy(ai_memory)
                 ai_result = run_ai_advisor(ai_input, ai_config)
                 ai_result["input_summary"] = {
                     "ads": len(ai_input.get("ads") or []),
