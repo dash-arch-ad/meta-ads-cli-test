@@ -20,13 +20,11 @@ free_tier_guardrails:
   gemini_2_5_flash_free_rpm: 10
   gemini_2_5_flash_free_tpm: 250000
 
-objective: CPAを悪化させずCVを増やす
-
 thresholds:
-  target_cpa: null
-  target_cpa_source: unset
-  min_spend_for_pause_review: 3000
-  min_spend_for_creative_review: 2000
+  pause_watch_target_cpa_multiplier: 1.5
+  pause_review_target_cpa_multiplier: 2.0
+  hard_pause_review_target_cpa_multiplier: 3.0
+  creative_review_min_target_cpa_multiplier: 0.5
   min_conversions_for_keep: 1
   min_conversions_for_scale_review: 2
 
