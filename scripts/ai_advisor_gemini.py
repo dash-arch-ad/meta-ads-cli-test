@@ -390,6 +390,10 @@ def validate_proposal(
                 validation_notes.append(f"{section}: disallowed_action:{ad_ref}:{action}")
                 continue
 
+            normalized["ad_name"] = str(ad.get("ad_name") or "").strip()
+            normalized["campaign_name"] = str(ad.get("campaign_name") or "").strip()
+            normalized["campaign_ref"] = str(ad.get("campaign_ref") or "").strip()
+
             if section == "pause_candidates":
                 spend = float(ad.get("spend") or 0)
                 conversions = float(ad.get("conversions") or 0)
@@ -722,9 +726,14 @@ def append_decision_section(
         if item.get("guard_note") == "low_confidence_pause_downgraded_to_reference":
             priority = "reference"
 
+        ad_label = item.get("ad_name") or item.get("ad_ref") or "-"
+        campaign_label = item.get("campaign_name") or item.get("campaign_ref") or "-"
+
         lines.extend(
             [
-                f"- {item.get('ad_ref') or '-'}",
+                f"- {ad_label}",
+                f"  キャンペーン: {campaign_label}",
+                f"  参照ID: {item.get('ad_ref') or '-'}",
                 f"  理由: {item.get('reason') or '-'}",
                 f"  優先度: {priority}",
                 f"  確信度: {confidence}",

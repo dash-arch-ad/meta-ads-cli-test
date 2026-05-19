@@ -706,6 +706,8 @@ def build_ai_advisor_input(
             {
                 "ad_ref": public_ad_ref(ad["ad_id"]),
                 "campaign_ref": public_campaign_ref(ad["campaign_id"]),
+                "ad_name": str(ad.get("ad_name") or ""),
+                "campaign_name": str(ad.get("campaign_name") or ""),
                 "configured_status": ad.get("configured_status") or "",
                 "effective_status": ad.get("effective_status") or "",
                 "spend": round(spend, 2),
