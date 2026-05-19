@@ -253,7 +253,9 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
             "- Use only fields listed in data_contract.allowed_evidence as evidence.",
             "- Never infer demographics, targeting, offer, LP content, or creative content from ad_name/campaign_name.",
             "- If needed evidence is listed in data_contract.missing_evidence, say it is missing.",
-            "- Each candidate must include evidence_fields and missing_fields.",
+            "- Each ad candidate must include evidence_fields and missing_fields arrays.",
+            "- Each creative_suggestions item must include evidence_fields and missing_fields arrays.",
+            "- Each rule_change_suggestions item must include evidence_fields and missing_fields arrays.",
             "- If rules.target_cpa_source is not configured, do not compare against a target CPA or suggest a target CPA amount.",
             "- summary <= 80 Japanese chars.",
             "- each array <= 3 items.",
@@ -288,7 +290,7 @@ def build_request_payload(
         },
     }
 
-    if use_schema:
+    if use_schema and bool(config.get("use_response_schema", True)):
         generation_config["responseJsonSchema"] = ADVISOR_RESPONSE_SCHEMA
 
     return {
@@ -724,7 +726,8 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
     try:
         result["sent_to_model"] = True
         result["api_calls"] = 1
-        gemini_result = call_gemini(ai_input, config, api_key)
+        use_response_schema = bool(config.get("use_response_schema", True))
+        gemini_result = call_gemini(ai_input, config, api_key, use_schema=use_response_schema)
         result["model"] = gemini_result["model"]
         proposal, validation_notes = validate_proposal(gemini_result["proposal"], ai_input, config)
         result["proposal"] = proposal
@@ -783,7 +786,12 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
                 if delay > 0:
                     time.sleep(delay)
 
-                gemini_result = call_gemini(ai_input, config, api_key)
+                gemini_result = call_gemini(
+                    ai_input,
+                    config,
+                    api_key,
+                    use_schema=bool(config.get("use_response_schema", True)),
+                )
                 result["model"] = gemini_result["model"]
                 proposal, validation_notes = validate_proposal(
                     gemini_result["proposal"],
