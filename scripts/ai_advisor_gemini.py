@@ -256,7 +256,9 @@ def prompt_for(ai_input: dict[str, Any], *, compact_retry: bool = False) -> str:
             "- Each ad candidate must include evidence_fields and missing_fields arrays.",
             "- Each creative_suggestions item must include evidence_fields and missing_fields arrays.",
             "- Each rule_change_suggestions item must include evidence_fields and missing_fields arrays.",
-            "- If rules.target_cpa_source is not configured, do not compare against a target CPA or suggest a target CPA amount.",
+            "- If rules.target_cpa_source is unset, do not compare against a target CPA or suggest a target CPA amount.",
+            "- If ad.adset_target_cpa exists, it is the Meta ad set result cost goal and may be used as target CPA evidence.",
+            "- Judge spend thresholds by ad.adset_target_cpa multipliers in rules, not by fixed yen amounts.",
             "- summary <= 80 Japanese chars.",
             "- each array <= 3 items.",
             "- reason/message <= 60 Japanese chars.",
@@ -437,6 +439,28 @@ def evidence_contract(ai_input: dict[str, Any]) -> tuple[set[str], set[str]]:
     return allowed, missing
 
 
+def positive_float(value: Any) -> float | None:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+
+    if number <= 0:
+        return None
+    return number
+
+
+def pause_review_min_spend_for_ad(ad: dict[str, Any], thresholds: dict[str, Any]) -> float:
+    target_cpa = positive_float(ad.get("adset_target_cpa"))
+    multiplier = positive_float(thresholds.get("pause_review_target_cpa_multiplier"))
+
+    if target_cpa is not None and multiplier is not None:
+        return target_cpa * multiplier
+
+    legacy_fixed_amount = positive_float(thresholds.get("min_spend_for_pause_review"))
+    return legacy_fixed_amount or 0.0
+
+
 def validate_proposal(
     proposal: dict[str, Any],
     ai_input: dict[str, Any],
@@ -447,7 +471,6 @@ def validate_proposal(
     thresholds = config.get("thresholds") or {}
     rules = ai_input.get("rules") or {}
     allowed_evidence, missing_evidence = evidence_contract(ai_input)
-    min_pause_spend = float(thresholds.get("min_spend_for_pause_review", 0) or 0)
     validation_notes: list[str] = []
 
     clean: dict[str, Any] = {
@@ -504,12 +527,13 @@ def validate_proposal(
                 normalized["evidence_fields"] = ["spend", "conversions"]
                 validation_notes.append(f"{section}: empty_evidence_fields:{ad_ref}")
 
-            if rules.get("target_cpa_source") != "configured" and "target_cpa" not in normalized["missing_fields"]:
+            if rules.get("target_cpa_source") == "unset" and "target_cpa" not in normalized["missing_fields"]:
                 normalized["missing_fields"].append("target_cpa")
 
             if section == "pause_candidates":
                 spend = float(ad.get("spend") or 0)
                 conversions = float(ad.get("conversions") or 0)
+                min_pause_spend = pause_review_min_spend_for_ad(ad, thresholds)
 
                 if spend < min_pause_spend:
                     validation_notes.append(f"{section}: spend_below_min:{ad_ref}")
@@ -541,7 +565,7 @@ def validate_proposal(
         validation_notes,
         allowed_evidence,
         missing_evidence,
-        rules.get("target_cpa_source") == "configured",
+        rules.get("target_cpa_source") != "unset",
     )
 
     return clean, validation_notes

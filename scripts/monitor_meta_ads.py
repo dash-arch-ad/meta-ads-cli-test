@@ -452,6 +452,33 @@ def fetch_ad_state(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
     }
 
 
+def fetch_adset_state(config: dict[str, Any], adset_id: str) -> dict[str, Any]:
+    payload = graph_api_request_json(
+        config,
+        "GET",
+        adset_id,
+        {
+            "fields": (
+                "id,name,status,effective_status,bid_amount,bid_strategy,"
+                "optimization_goal,billing_event,daily_budget,lifetime_budget"
+            ),
+        },
+    )
+
+    return {
+        "id": str(payload.get("id") or adset_id),
+        "name": str(payload.get("name") or ""),
+        "configured_status": str(payload.get("status") or ""),
+        "effective_status": str(payload.get("effective_status") or ""),
+        "bid_amount": payload.get("bid_amount"),
+        "bid_strategy": payload.get("bid_strategy"),
+        "optimization_goal": payload.get("optimization_goal"),
+        "billing_event": payload.get("billing_event"),
+        "daily_budget": payload.get("daily_budget"),
+        "lifetime_budget": payload.get("lifetime_budget"),
+    }
+
+
 def enrich_ads_with_current_state(
     config: dict[str, Any],
     rows: list[dict[str, Any]],
@@ -462,12 +489,15 @@ def enrich_ads_with_current_state(
     Those ads must not be matched, paused again, or notified.
     """
     state_cache: dict[str, dict[str, Any]] = {}
+    adset_state_cache: dict[str, dict[str, Any]] = {}
     enriched_rows: list[dict[str, Any]] = []
     summary = {
         "state_checked": 0,
+        "adset_state_checked": 0,
         "active": 0,
         "not_active": 0,
         "state_check_failed": 0,
+        "adset_state_check_failed": 0,
     }
 
     for row in rows:
@@ -492,6 +522,33 @@ def enrich_ads_with_current_state(
             enriched["_current_ad_name"] = ad_name
             enriched["_configured_status"] = configured_status
             enriched["_effective_status"] = effective_status
+
+            adset_id = str(enriched.get("adset_id") or "")
+            if adset_id:
+                try:
+                    if adset_id not in adset_state_cache:
+                        adset_state_cache[adset_id] = fetch_adset_state(config, adset_id)
+                        summary["adset_state_checked"] += 1
+
+                    adset_state = adset_state_cache[adset_id]
+                    enriched["_current_adset_id"] = adset_id
+                    enriched["_current_adset_name"] = (
+                        adset_state.get("name")
+                        or enriched.get("adset_name")
+                        or ""
+                    )
+                    enriched["_adset_configured_status"] = adset_state.get("configured_status") or ""
+                    enriched["_adset_effective_status"] = adset_state.get("effective_status") or ""
+                    enriched["_adset_bid_amount"] = adset_state.get("bid_amount")
+                    enriched["_adset_bid_strategy"] = adset_state.get("bid_strategy")
+                    enriched["_adset_optimization_goal"] = adset_state.get("optimization_goal")
+                    enriched["_adset_billing_event"] = adset_state.get("billing_event")
+                    enriched["_adset_daily_budget"] = adset_state.get("daily_budget")
+                    enriched["_adset_lifetime_budget"] = adset_state.get("lifetime_budget")
+
+                except Exception as exc:
+                    enriched["_adset_state_check_error"] = redact_text(exc)
+                    summary["adset_state_check_failed"] += 1
 
             if configured_status == ACTIVE_STATUS and effective_status == ACTIVE_STATUS:
                 summary["active"] += 1
@@ -519,6 +576,8 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
         **raw,
         "ad_id": str(raw.get("ad_id") or raw.get("id") or raw.get("_current_ad_id") or ""),
         "ad_name": raw.get("_current_ad_name") or raw.get("ad_name") or raw.get("name") or "",
+        "adset_id": str(raw.get("adset_id") or raw.get("_current_adset_id") or ""),
+        "adset_name": raw.get("_current_adset_name") or raw.get("adset_name") or "",
         "campaign_id": str(raw.get("campaign_id") or ""),
         "campaign_name": raw.get("campaign_name") or "",
         "spend": spend,
@@ -527,6 +586,15 @@ def normalize_ad(raw: dict[str, Any], conversion_event: str) -> dict[str, Any]:
         "configured_status": configured_status,
         "effective_status": effective_status,
         "state_check_error": raw.get("_state_check_error"),
+        "adset_state_check_error": raw.get("_adset_state_check_error"),
+        "adset_configured_status": raw.get("_adset_configured_status"),
+        "adset_effective_status": raw.get("_adset_effective_status"),
+        "adset_bid_amount": raw.get("_adset_bid_amount"),
+        "adset_bid_strategy": raw.get("_adset_bid_strategy"),
+        "adset_optimization_goal": raw.get("_adset_optimization_goal"),
+        "adset_billing_event": raw.get("_adset_billing_event"),
+        "adset_daily_budget": raw.get("_adset_daily_budget"),
+        "adset_lifetime_budget": raw.get("_adset_lifetime_budget"),
         "is_active": configured_status == ACTIVE_STATUS and effective_status == ACTIVE_STATUS,
     }
 
@@ -700,6 +768,14 @@ def value_or_none(value: Any, digits: int = 2) -> float | None:
     return round(number(value), digits)
 
 
+def minor_currency_to_major(value: Any) -> float | None:
+    numeric = value_or_none(value, digits=0)
+    if numeric is None:
+        return None
+
+    return round(numeric / 100, 2)
+
+
 def compact_operation_philosophy(memory: dict[str, Any], max_items: int = 10) -> dict[str, Any]:
     root = memory.get("meta_ads_operation_philosophy")
     if not isinstance(root, dict):
@@ -737,10 +813,10 @@ def build_ai_advisor_input(
     thresholds = ai_config.get("thresholds") or {}
     window = allowed_graph_date_preset(insights_window(guard_config))
     max_ads = int(ai_config.get("max_ads", 12) or 12)
-    target_cpa_source = str(thresholds.get("target_cpa_source") or "unset")
-    target_cpa = thresholds.get("target_cpa") if target_cpa_source == "configured" else None
 
     ai_ads: list[dict[str, Any]] = []
+    adset_target_cpas: list[float] = []
+    adset_state_errors = 0
 
     for raw in ads:
         ad = normalize_ad(raw, conversion_event)
@@ -777,6 +853,12 @@ def build_ai_advisor_input(
         if cpc is None and clicks > 0:
             cpc = round(spend / clicks, 2)
 
+        adset_target_cpa = minor_currency_to_major(ad.get("adset_bid_amount"))
+        if adset_target_cpa is not None:
+            adset_target_cpas.append(adset_target_cpa)
+        if ad.get("adset_state_check_error"):
+            adset_state_errors += 1
+
         ai_ads.append(
             {
                 "ad_ref": public_ad_ref(ad["ad_id"]),
@@ -784,6 +866,14 @@ def build_ai_advisor_input(
                 "ad_name": str(ad.get("ad_name") or ""),
                 "adset_ref": public_adset_ref(ad.get("adset_id")) if ad.get("adset_id") else "",
                 "adset_name": str(ad.get("adset_name") or ""),
+                "adset_configured_status": ad.get("adset_configured_status") or "",
+                "adset_effective_status": ad.get("adset_effective_status") or "",
+                "adset_target_cpa": adset_target_cpa,
+                "adset_bid_strategy": ad.get("adset_bid_strategy") or "",
+                "adset_optimization_goal": ad.get("adset_optimization_goal") or "",
+                "adset_billing_event": ad.get("adset_billing_event") or "",
+                "adset_daily_budget": minor_currency_to_major(ad.get("adset_daily_budget")),
+                "adset_lifetime_budget": minor_currency_to_major(ad.get("adset_lifetime_budget")),
                 "campaign_name": str(ad.get("campaign_name") or ""),
                 "configured_status": ad.get("configured_status") or "",
                 "effective_status": ad.get("effective_status") or "",
@@ -812,12 +902,24 @@ def build_ai_advisor_input(
         ),
     )[:max_ads]
 
+    unique_target_cpas = sorted(set(adset_target_cpas))
+    target_cpa_source = "meta_adset_bid_amount" if unique_target_cpas else "unset"
+    target_cpa = unique_target_cpas[0] if len(unique_target_cpas) == 1 else None
+
     return {
         "data_contract": {
             "allowed_evidence": [
                 "ad_name",
                 "campaign_name",
                 "adset_name",
+                "adset_configured_status",
+                "adset_effective_status",
+                "adset_target_cpa",
+                "adset_bid_strategy",
+                "adset_optimization_goal",
+                "adset_billing_event",
+                "adset_daily_budget",
+                "adset_lifetime_budget",
                 "configured_status",
                 "effective_status",
                 "spend",
@@ -848,7 +950,8 @@ def build_ai_advisor_input(
                 "campaign_level_summary",
                 "adset_level_summary",
                 "lookback_3d_7d_14d_28d",
-                *(["target_cpa"] if target_cpa is None else []),
+                *(["target_cpa"] if not unique_target_cpas else []),
+                *(["adset_bid_settings"] if adset_state_errors else []),
             ],
             "instruction": "allowed_evidenceにない情報を根拠に断定しない。広告名から年齢、性別、訴求、LP内容を推測しない。",
         },
@@ -861,7 +964,11 @@ def build_ai_advisor_input(
         "rules": {
             "target_cpa": target_cpa,
             "target_cpa_source": target_cpa_source,
-            "min_spend_for_pause_review": thresholds.get("min_spend_for_pause_review"),
+            "adset_target_cpas": unique_target_cpas,
+            "pause_watch_target_cpa_multiplier": thresholds.get("pause_watch_target_cpa_multiplier"),
+            "pause_review_target_cpa_multiplier": thresholds.get("pause_review_target_cpa_multiplier"),
+            "hard_pause_review_target_cpa_multiplier": thresholds.get("hard_pause_review_target_cpa_multiplier"),
+            "creative_review_min_target_cpa_multiplier": thresholds.get("creative_review_min_target_cpa_multiplier"),
             "min_conversions_for_scale_review": thresholds.get("min_conversions_for_scale_review"),
         },
         "ads": ai_ads,
@@ -1032,6 +1139,7 @@ def build_test_status_chatwork_message(output: dict[str, Any]) -> str:
                         f"active: {state.get('active', 0)}",
                         f"not_active: {state.get('not_active', 0)}",
                         f"state_check_failed: {state.get('state_check_failed', 0)}",
+                        f"adset_state_check_failed: {state.get('adset_state_check_failed', 0)}",
                     ]
                 )
             )
