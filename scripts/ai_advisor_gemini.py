@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -37,6 +38,14 @@ FORBIDDEN_ACTIONS = {
 VALID_PRIORITIES = {"high", "medium", "low", "reference"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_RISKS = {"high", "medium", "low"}
+TRANSIENT_GEMINI_STATUSES = {429, 500, 502, 503, 504}
+
+
+class GeminiApiError(RuntimeError):
+    def __init__(self, status: int | None, message: str, *, transient: bool = False) -> None:
+        super().__init__(message)
+        self.status = status
+        self.transient = transient
 
 
 AD_DECISION_SCHEMA: dict[str, Any] = {
@@ -282,9 +291,13 @@ def call_gemini(
             api_payload = json.loads(body)
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"Gemini API request failed: status={exc.code}, body={body[:800]}") from exc
+        raise GeminiApiError(
+            exc.code,
+            f"Gemini API request failed: status={exc.code}, body={body[:800]}",
+            transient=exc.code in TRANSIENT_GEMINI_STATUSES,
+        ) from exc
     except urllib.error.URLError as exc:
-        raise RuntimeError(f"Gemini API request failed: {exc}") from exc
+        raise GeminiApiError(None, f"Gemini API request failed: {exc}", transient=True) from exc
 
     text = extract_text(api_payload)
     try:
@@ -621,6 +634,43 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
 
         result["error"] = str(exc)
         result["error_type"] = "invalid_response"
+        return result
+    except GeminiApiError as exc:
+        max_calls = int(config.get("max_gemini_calls_per_run", 1) or 1)
+        should_retry = (
+            exc.transient
+            and bool(config.get("retry_on_transient_api_error", False))
+            and max_calls >= 2
+        )
+
+        if should_retry:
+            try:
+                result["retried"] = True
+                result["api_calls"] = 2
+                delay = float(config.get("retry_delay_seconds", 5) or 5)
+                if delay > 0:
+                    time.sleep(delay)
+
+                gemini_result = call_gemini(ai_input, config, api_key)
+                result["model"] = gemini_result["model"]
+                proposal, validation_notes = validate_proposal(
+                    gemini_result["proposal"],
+                    ai_input,
+                    config,
+                )
+                result["proposal"] = proposal
+                result["validation_notes"] = [
+                    f"retried_after_transient_api_error:{exc.status}",
+                    *validation_notes,
+                ]
+                return result
+            except Exception as retry_exc:
+                result["error"] = f"first={exc}; retry={retry_exc}"
+                result["error_type"] = "api_error"
+                return result
+
+        result["error"] = str(exc)
+        result["error_type"] = "api_error"
         return result
     except RuntimeError as exc:
         result["error"] = str(exc)
