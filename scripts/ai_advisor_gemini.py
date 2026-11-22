@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -39,6 +40,14 @@ VALID_PRIORITIES = {"high", "medium", "low", "reference"}
 VALID_CONFIDENCES = {"high", "medium", "low"}
 VALID_RISKS = {"high", "medium", "low"}
 TRANSIENT_GEMINI_STATUSES = {429, 500, 502, 503, 504}
+
+
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, newurl):
+        return None
+
+
+HTTP_OPENER = urllib.request.build_opener(NoRedirect())
 
 
 class GeminiApiError(RuntimeError):
@@ -179,7 +188,7 @@ ADVISOR_RESPONSE_SCHEMA: dict[str, Any] = {
 
 def load_ai_config(path: Path) -> dict[str, Any]:
     if not path.exists():
-        return {"enabled": False, "skip_reason": f"{path} does not exist."}
+        return {"enabled": False, "skip_reason": "AI advisor config file is missing."}
 
     with path.open("r", encoding="utf-8") as fh:
         config = yaml.safe_load(fh) or {}
@@ -192,13 +201,13 @@ def load_ai_config(path: Path) -> dict[str, Any]:
 
 def load_ai_memory(path: Path) -> tuple[dict[str, Any] | None, list[str]]:
     if not path.exists():
-        return None, [f"ai_memory_not_found:{path}"]
+        return None, ["ai_memory_not_found"]
 
     try:
         with path.open("r", encoding="utf-8") as fh:
             memory = yaml.safe_load(fh) or {}
-    except Exception as exc:
-        return None, [f"ai_memory_load_failed:{exc}"]
+    except Exception:
+        return None, ["ai_memory_load_failed"]
 
     if not isinstance(memory, dict):
         return None, ["ai_memory_root_not_mapping"]
@@ -315,6 +324,8 @@ def call_gemini(
     compact_retry: bool = False,
 ) -> dict[str, Any]:
     model = resolve_model(config)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", model):
+        raise GeminiApiError(None, "Invalid Gemini model name.")
     url = GEMINI_ENDPOINT_TEMPLATE.format(model=model)
     payload = json.dumps(
         build_request_payload(
@@ -337,29 +348,25 @@ def call_gemini(
 
     try:
         timeout = int(config.get("timeout_seconds", 20) or 20)
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with HTTP_OPENER.open(request, timeout=timeout) as response:
             body = response.read().decode("utf-8", errors="replace")
             api_payload = json.loads(body)
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        exc.close()
         raise GeminiApiError(
             exc.code,
-            f"Gemini API request failed: status={exc.code}, body={body[:800]}",
+            f"Gemini API failed (HTTP {exc.code}).",
             transient=exc.code in TRANSIENT_GEMINI_STATUSES,
-        ) from exc
-    except urllib.error.URLError as exc:
-        raise GeminiApiError(None, f"Gemini API request failed: {exc}", transient=True) from exc
+        ) from None
+    except urllib.error.URLError:
+        raise GeminiApiError(None, "Gemini API connection failed.", transient=True) from None
 
-    text = extract_text(api_payload)
+    if not isinstance(api_payload, dict) or "error" in api_payload:
+        raise GeminiApiError(None, "Gemini API returned an invalid response.")
     try:
-        response_json = parse_json_object_text(text)
-    except json.JSONDecodeError as exc:
-        first_candidate = (api_payload.get("candidates") or [{}])[0]
-        finish_reason = first_candidate.get("finishReason") or "unknown"
-        raise ValueError(
-            "Gemini response was not valid JSON: "
-            f"finish_reason={finish_reason}, text={text[:800]}"
-        ) from exc
+        response_json = parse_json_object_text(extract_text(api_payload))
+    except (AttributeError, IndexError, TypeError, ValueError):
+        raise ValueError("Gemini proposal could not be decoded.") from None
 
     return {
         "model": model,
@@ -961,11 +968,11 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
         result["proposal"] = proposal
         result["validation_notes"] = validation_notes
         return result
-    except (TimeoutError, socket.timeout) as exc:
-        result["error"] = str(exc)
+    except (TimeoutError, socket.timeout):
+        result["error"] = "Gemini API timed out."
         result["error_type"] = "api_timeout"
         return result
-    except ValueError as exc:
+    except ValueError:
         max_calls = int(config.get("max_gemini_calls_per_run", 1) or 1)
         if bool(config.get("retry_on_invalid_json", False)) and max_calls >= 2:
             try:
@@ -990,12 +997,12 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
                     *validation_notes,
                 ]
                 return result
-            except Exception as retry_exc:
-                result["error"] = f"first={exc}; retry={retry_exc}"
+            except Exception:
+                result["error"] = "Gemini returned an invalid proposal after retry."
                 result["error_type"] = "invalid_response"
                 return result
 
-        result["error"] = str(exc)
+        result["error"] = "Gemini returned an invalid proposal."
         result["error_type"] = "invalid_response"
         return result
     except GeminiApiError as exc:
@@ -1032,20 +1039,24 @@ def run_ai_advisor(ai_input: dict[str, Any], config: dict[str, Any]) -> dict[str
                     *validation_notes,
                 ]
                 return result
-            except Exception as retry_exc:
-                result["error"] = f"first={exc}; retry={retry_exc}"
+            except GeminiApiError as retry_exc:
+                result["error"] = str(retry_exc)
+                result["error_type"] = "api_error"
+                return result
+            except Exception:
+                result["error"] = "Gemini request failed after retry."
                 result["error_type"] = "api_error"
                 return result
 
         result["error"] = str(exc)
         result["error_type"] = "api_error"
         return result
-    except RuntimeError as exc:
-        result["error"] = str(exc)
+    except RuntimeError:
+        result["error"] = "Gemini request failed."
         result["error_type"] = "api_error"
         return result
-    except Exception as exc:
-        result["error"] = str(exc)
+    except Exception:
+        result["error"] = "AI advisor failed."
         result["error_type"] = "unexpected_error"
         return result
 
