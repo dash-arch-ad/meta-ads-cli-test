@@ -4,6 +4,8 @@ from __future__ import annotations
 import argparse
 import ast
 import json
+import math
+import re
 import os
 import sys
 import urllib.error
@@ -18,6 +20,7 @@ from typing import Any
 import yaml
 
 from ai_advisor_gemini import (
+    HTTP_OPENER,
     build_chatwork_message as build_ai_chatwork_message,
     load_ai_config,
     load_ai_memory,
@@ -99,46 +102,30 @@ def public_adset_ref(adset_id: Any) -> str:
     return f"adset_{short_hash(adset_id)}"
 
 
-def secret_values() -> list[str]:
-    values: list[str] = []
-
-    for key, value in os.environ.items():
-        if not value:
-            continue
-        if any(hint in key.upper() for hint in SENSITIVE_ENV_HINTS):
-            values.append(value)
-
-    guard_env = os.getenv("META_GUARD_ENV")
-    if guard_env:
-        values.append(guard_env)
-
-    account_id = os.getenv("META_AD_ACCOUNT_ID")
-    if account_id:
-        values.extend([account_id, account_id.removeprefix("act_")])
-
-    room_id = os.getenv("CHATWORK_ROOM_ID")
-    if room_id:
-        values.append(room_id)
-
-    allowed_campaign_ids = os.getenv("META_ALLOWED_CAMPAIGN_IDS")
-    if allowed_campaign_ids:
-        values.extend(
-            item.strip()
-            for item in allowed_campaign_ids.replace("\n", ",").split(",")
-            if item.strip()
-        )
-
-    return sorted(set(values), key=len, reverse=True)
-
-
-def redact_text(value: Any) -> str:
-    text = str(value)
-
-    for secret in secret_values():
-        if secret:
-            text = text.replace(secret, "[REDACTED]")
-
+def redact_credentials(text: str) -> str:
+    values = {value for key, value in os.environ.items()
+              if value and any(hint in key.upper() for hint in SENSITIVE_ENV_HINTS)}
+    forms = values | {urllib.parse.quote(value, safe="") for value in values}
+    forms.update(urllib.parse.quote_plus(value) for value in values)
+    for value in sorted(forms, key=len, reverse=True):
+        text = text.replace(value, "[REDACTED]")
     return text
+
+
+def redact_result(value: Any) -> Any:
+    if isinstance(value, str):
+        return redact_credentials(value)
+    if isinstance(value, dict):
+        return {redact_credentials(key): redact_result(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_result(item) for item in value]
+    return value
+
+
+def safe_error(error: Exception) -> str:
+    if isinstance(error, MonitorError):
+        return str(error)
+    return "Monitor operation failed. Check configuration or service availability."
 
 
 def env_bool(name: str, default: bool) -> bool:
@@ -186,7 +173,7 @@ def allowed_campaign_ids_from_config_or_env(config: dict[str, Any]) -> list[str]
 def require_safe_config(config: dict[str, Any]) -> None:
     mode = config.get("mode", "dry_run")
     if mode not in ALLOWED_MODES:
-        raise ValueError(f"Unsupported mode: {mode!r}. Use dry_run or active.")
+        raise MonitorError("Unsupported mode. Use dry_run or active.")
 
     safety = config.get("safety") or {}
     forbidden_flags = {
@@ -198,15 +185,15 @@ def require_safe_config(config: dict[str, Any]) -> None:
 
     for key, required in forbidden_flags.items():
         if safety.get(key) is not required:
-            raise ValueError(f"Unsafe config: safety.{key} must be {required}.")
+            raise MonitorError(f"Unsafe config: safety.{key} must be {required}.")
 
     max_pauses = int(safety.get("max_pauses_per_run", 0))
     if max_pauses < 1 or max_pauses > 100:
-        raise ValueError("Unsafe config: safety.max_pauses_per_run must be between 1 and 100.")
+        raise MonitorError("Unsafe config: safety.max_pauses_per_run must be between 1 and 100.")
 
     allowed_campaign_ids = allowed_campaign_ids_from_config_or_env(config)
     if not allowed_campaign_ids:
-        raise ValueError(
+        raise MonitorError(
             "Unsafe config: META_ALLOWED_CAMPAIGN_IDS or target.allowed_campaign_ids must not be empty. "
             "Set META_ALLOWED_CAMPAIGN_IDS to comma-separated target campaign IDs. "
             "The SET_META_ALLOWED_CAMPAIGN_IDS_IN_SECRET value in config/rules.yml is only a placeholder."
@@ -214,38 +201,55 @@ def require_safe_config(config: dict[str, Any]) -> None:
 
     for rule in config.get("rules") or []:
         if rule.get("level") != "ad":
-            raise ValueError(f"Unsupported rule level for {rule.get('name')}: only ad is allowed.")
+            raise MonitorError("Unsupported rule level. Only ad is allowed.")
         if rule.get("action") not in ALLOWED_ACTIONS:
-            raise ValueError(f"Unsupported rule action for {rule.get('name')}: only pause_ad is allowed.")
+            raise MonitorError("Unsupported rule action. Only pause_ad is allowed.")
 
 
 def resolve_ad_account_id(config: dict[str, Any]) -> str:
     account_id = os.getenv("META_AD_ACCOUNT_ID") or (config.get("meta") or {}).get("ad_account_id")
 
     if not account_id or account_id == "act_xxxxxxxxxx":
-        raise ValueError("META_AD_ACCOUNT_ID or meta.ad_account_id must be set.")
+        raise MonitorError("META_AD_ACCOUNT_ID or meta.ad_account_id must be set.")
 
     return account_id
 
 
 def require_token() -> None:
     if not os.getenv("META_ACCESS_TOKEN"):
-        raise ValueError("META_ACCESS_TOKEN must be set in the environment or .env.")
+        raise MonitorError("META_ACCESS_TOKEN must be set in the environment or .env.")
 
 
 def meta_access_token() -> str:
     token = os.getenv("META_ACCESS_TOKEN")
     if not token:
-        raise ValueError("META_ACCESS_TOKEN must be set.")
+        raise MonitorError("META_ACCESS_TOKEN must be set.")
     return token
 
 
+class MonitorError(RuntimeError):
+    """Fixed diagnostics safe to show in terminal output and reports."""
+
+
 def graph_api_version(config: dict[str, Any]) -> str:
-    return (
+    version = (
         os.getenv("META_GRAPH_API_VERSION")
         or (config.get("meta_api") or {}).get("version")
-        or "v25.0"
+        or "v27.0"
     )
+    if not isinstance(version, str) or not re.fullmatch(r"v[0-9]+\.[0-9]+", version):
+        raise MonitorError("Invalid Meta Graph API version.")
+    return version
+
+
+def meta_api_error(status: int, payload: Any) -> MonitorError:
+    details = [f"HTTP {status}"]
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if isinstance(error, dict):
+        for key in ("code", "error_subcode"):
+            if type(error.get(key)) is int:
+                details.append(f"{key}={error[key]}")
+    return MonitorError("Meta API failed (" + ", ".join(details) + ").")
 
 
 def graph_api_request_json(
@@ -253,46 +257,68 @@ def graph_api_request_json(
     method: str,
     path: str,
     params: dict[str, Any] | None = None,
-    *,
-    absolute_url: str | None = None,
 ) -> dict[str, Any]:
-    method = method.upper()
-
-    if absolute_url:
-        url = absolute_url
-        data = None
+    if not re.fullmatch(r"[0-9]+(?:/insights)?", path) or method not in {"GET", "POST"}:
+        raise MonitorError("Invalid Meta Graph API request.")
+    url = f"https://graph.facebook.com/{graph_api_version(config)}/{path}"
+    request_params = dict(params or {})
+    request_params.pop("access_token", None)
+    encoded = urllib.parse.urlencode(request_params)
+    data = None
+    if method == "GET":
+        if encoded:
+            url += "?" + encoded
     else:
-        version = graph_api_version(config)
-        base_url = f"https://graph.facebook.com/{version}/{path.lstrip('/')}"
-        request_params = dict(params or {})
-        request_params["access_token"] = meta_access_token()
-
-        if method == "GET":
-            url = f"{base_url}?{urllib.parse.urlencode(request_params)}"
-            data = None
-        else:
-            url = base_url
-            data = urllib.parse.urlencode(request_params).encode("utf-8")
-
-    request = urllib.request.Request(url, data=data, method=method)
-
+        data = encoded.encode("utf-8")
+    request = urllib.request.Request(
+        url, data=data, method=method,
+        headers={"Authorization": f"Bearer {meta_access_token()}"},
+    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8", errors="replace")
-            payload = json.loads(body)
-            if not isinstance(payload, dict):
-                raise RuntimeError("Meta Graph API returned non-object JSON.")
-            return payload
-
+        with HTTP_OPENER.open(request, timeout=30) as response:
+            status = response.status
+            payload = json.loads(response.read())
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Meta Graph API request failed: method={method}, status={exc.code}, "
-            f"body={redact_text(body)[:1000]}"
-        ) from exc
+        try:
+            with exc:
+                payload = json.loads(exc.read(32768))
+        except (OSError, ValueError):
+            payload = None
+        raise meta_api_error(exc.code, payload) from None
+    except (OSError, urllib.error.URLError):
+        raise MonitorError("Meta API connection failed.") from None
+    except ValueError:
+        raise MonitorError("Meta API returned invalid JSON.") from None
+    if not 200 <= status < 300 or (isinstance(payload, dict) and "error" in payload):
+        raise meta_api_error(status, payload)
+    if not isinstance(payload, dict):
+        raise MonitorError("Meta API returned non-object JSON.")
+    return payload
 
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Meta Graph API request failed: method={method}, error={redact_text(exc)}") from exc
+
+def meta_next_cursor(url: str, path: str, version: str, paging: dict,
+                     original_params: dict[str, Any]) -> str:
+    if not isinstance(url, str):
+        raise MonitorError("Meta API returned invalid paging.")
+    try:
+        target = urllib.parse.urlsplit(url)
+        query = urllib.parse.parse_qs(target.query, keep_blank_values=True)
+    except ValueError:
+        raise MonitorError("Meta API returned invalid paging.") from None
+    if (target.scheme, target.netloc, target.path) != (
+        "https", "graph.facebook.com", f"/{version}/{path}"
+    ):
+        raise MonitorError("Meta API returned an unexpected paging destination.")
+    if target.fragment or set(query) - (set(original_params) | {"after", "access_token"}):
+        raise MonitorError("Meta API returned unsupported paging.")
+    cursors = paging.get("cursors", {})
+    if not isinstance(cursors, dict):
+        raise MonitorError("Meta API returned invalid cursors.")
+    options = query.get("after", [])
+    cursor = cursors.get("after", options[0] if len(options) == 1 else None)
+    if not isinstance(cursor, str) or not cursor or (options and options != [cursor]):
+        raise MonitorError("Meta API returned invalid paging.")
+    return cursor
 
 
 def graph_api_get_paginated_data(
@@ -302,25 +328,26 @@ def graph_api_get_paginated_data(
 ) -> tuple[list[dict[str, Any]], int]:
     rows: list[dict[str, Any]] = []
     pages = 0
-
-    payload = graph_api_request_json(config, "GET", path, params)
-    pages += 1
-
+    seen: set[str] = set()
+    page_params = dict(params)
+    version = graph_api_version(config)
     while True:
-        data = payload.get("data") or []
-        if not isinstance(data, list):
-            raise RuntimeError("Meta Graph API data field was not a list.")
-
-        rows.extend([row for row in data if isinstance(row, dict)])
-
-        next_url = (payload.get("paging") or {}).get("next")
-        if not next_url:
-            break
-
-        payload = graph_api_request_json(config, "GET", "", absolute_url=next_url)
+        payload = graph_api_request_json(config, "GET", path, page_params)
         pages += 1
-
-    return rows, pages
+        data = payload.get("data")
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            raise MonitorError("Meta API returned invalid page data.")
+        rows.extend(data)
+        paging = payload.get("paging", {})
+        if not isinstance(paging, dict):
+            raise MonitorError("Meta API returned invalid paging.")
+        if "next" not in paging:
+            return rows, pages
+        cursor = meta_next_cursor(paging["next"], path, version, paging, params)
+        if cursor in seen or meta_access_token() in cursor:
+            raise MonitorError("Meta API returned an invalid or repeated cursor.")
+        seen.add(cursor)
+        page_params["after"] = cursor
 
 
 def allowed_graph_date_preset(window: str) -> str:
@@ -444,8 +471,12 @@ def fetch_ad_state(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
         },
     )
 
+    if str(payload.get("id")) != ad_id or any(
+        not isinstance(payload.get(key), str) or not payload[key] for key in ("status", "effective_status")
+    ):
+        raise MonitorError("Meta API returned incomplete ad status.")
     return {
-        "id": str(payload.get("id") or ad_id),
+        "id": ad_id,
         "name": str(payload.get("name") or ""),
         "configured_status": str(payload.get("status") or ""),
         "effective_status": str(payload.get("effective_status") or ""),
@@ -465,8 +496,12 @@ def fetch_adset_state(config: dict[str, Any], adset_id: str) -> dict[str, Any]:
         },
     )
 
+    if str(payload.get("id")) != adset_id or any(
+        not isinstance(payload.get(key), str) or not payload[key] for key in ("status", "effective_status")
+    ):
+        raise MonitorError("Meta API returned incomplete ad set status.")
     return {
-        "id": str(payload.get("id") or adset_id),
+        "id": adset_id,
         "name": str(payload.get("name") or ""),
         "configured_status": str(payload.get("status") or ""),
         "effective_status": str(payload.get("effective_status") or ""),
@@ -547,7 +582,7 @@ def enrich_ads_with_current_state(
                     enriched["_adset_lifetime_budget"] = adset_state.get("lifetime_budget")
 
                 except Exception as exc:
-                    enriched["_adset_state_check_error"] = redact_text(exc)
+                    enriched["_adset_state_check_error"] = safe_error(exc)
                     summary["adset_state_check_failed"] += 1
 
             if configured_status == ACTIVE_STATUS and effective_status == ACTIVE_STATUS:
@@ -556,7 +591,7 @@ def enrich_ads_with_current_state(
                 summary["not_active"] += 1
 
         except Exception as exc:
-            enriched["_state_check_error"] = redact_text(exc)
+            enriched["_state_check_error"] = safe_error(exc)
             summary["state_check_failed"] += 1
 
         enriched_rows.append(enriched)
@@ -986,27 +1021,47 @@ def insights_window(config: dict[str, Any]) -> str:
         return "24h"
 
     if len(windows) > 1:
-        raise ValueError("All rules must use the same window for one insights call.")
+        raise MonitorError("All rules must use the same window for one Insights call.")
 
     return next(iter(windows))
 
 
-def ensure_ad_level_insights(rows: list[dict[str, Any]]) -> None:
-    if not rows:
-        return
+def require_metric(value: Any, label: str) -> None:
+    try:
+        if type(value) not in (int, float, str):
+            raise ValueError
+        metric = float(str(value).replace(",", ""))
+    except (OverflowError, ValueError):
+        raise MonitorError(f"Meta API returned invalid {label}.") from None
+    if not math.isfinite(metric) or metric < 0:
+        raise MonitorError(f"Meta API returned invalid {label}.")
 
-    missing_ad_id_rows = [row for row in rows if not (row.get("ad_id") or row.get("id"))]
 
-    if missing_ad_id_rows and len(missing_ad_id_rows) == len(rows):
-        sample = missing_ad_id_rows[0]
-        safe_keys = sorted(str(key) for key in sample.keys())
-
-        raise RuntimeError(
-            "Meta Graph API insights did not return ad-level rows. "
-            "No ad_id was present, so ads cannot be paused. "
-            "The fetch must use level=ad. "
-            f"Returned keys: {safe_keys}"
-        )
+def ensure_ad_level_insights(rows: list[dict[str, Any]], campaign_id: str) -> None:
+    for row in rows:
+        if not re.fullmatch(r"[0-9]+", str(row.get("ad_id") or row.get("id") or "")):
+            raise MonitorError("Meta API returned a row without a valid ad ID.")
+        if str(row.get("campaign_id")) != campaign_id:
+            raise MonitorError("Meta API returned a row without the requested campaign ID.")
+        require_metric(row.get("spend"), "spend")
+        for field in ("actions", "conversions"):
+            if field not in row:
+                continue
+            actions = row[field]
+            if not isinstance(actions, list):
+                raise MonitorError("Meta API returned invalid conversion data.")
+            for action in actions:
+                if not isinstance(action, dict) or not any(
+                    isinstance(action.get(key), str) and action[key] for key in ("action_type", "type", "name")
+                ):
+                    raise MonitorError("Meta API returned invalid conversion data.")
+                raw = action.get("value")
+                if raw is None:
+                    raw = action.get("count")
+                require_metric(raw, "conversion count")
+        for field in ("conversion_count", "cv"):
+            if field in row:
+                require_metric(row[field], "conversion count")
 
 
 def fetch_insights(
@@ -1017,6 +1072,9 @@ def fetch_insights(
 
     meta_api = config.get("meta_api") or {}
     fields = meta_api.get("insights_fields") or DEFAULT_INSIGHTS_FIELDS
+    field_names = {field.strip() for field in fields.split(",")}
+    if not {"ad_id", "campaign_id", "spend"} <= field_names or not {"actions", "conversions"} & field_names:
+        raise MonitorError("Meta Insights fields must include ad ID, campaign ID, spend and conversion data.")
     window = allowed_graph_date_preset(insights_window(config))
 
     all_ads: list[dict[str, Any]] = []
@@ -1036,8 +1094,12 @@ def fetch_insights(
             params,
         )
 
-        ensure_ad_level_insights(rows)
+        ensure_ad_level_insights(rows, campaign_id)
         rows, state_summary = enrich_ads_with_current_state(config, rows)
+        if config.get("mode") == "active" and (
+            state_summary["state_check_failed"] or state_summary["adset_state_check_failed"]
+        ):
+            raise MonitorError("Meta ad or ad set status could not be confirmed. No ads were changed.")
         all_ads.extend(rows)
 
         fetch_summaries.append(
@@ -1065,10 +1127,7 @@ def pause_ad(config: dict[str, Any], ad_id: str) -> dict[str, Any]:
     )
 
     if payload.get("success") is not True:
-        raise RuntimeError(
-            f"Meta Graph API pause returned unexpected response for {public_ad_ref(ad_id)}: "
-            f"{redact_text(payload)}"
-        )
+        raise MonitorError("Meta API did not confirm the pause.")
 
     return {
         "success": True,
@@ -1163,8 +1222,10 @@ def notify_chatwork(message: str) -> dict[str, Any]:
             "reason": "CHATWORK_API_TOKEN or CHATWORK_ROOM_ID is not set.",
         }
 
+    if not re.fullmatch(r"[0-9]+", room_id):
+        return {"enabled": True, "sent": False, "error": "Invalid Chatwork room ID."}
     url = f"https://api.chatwork.com/v2/rooms/{room_id}/messages"
-    data = urllib.parse.urlencode({"body": message, "self_unread": "0"}).encode("utf-8")
+    data = urllib.parse.urlencode({"body": redact_credentials(message), "self_unread": "0"}).encode("utf-8")
 
     request = urllib.request.Request(
         url,
@@ -1177,8 +1238,7 @@ def notify_chatwork(message: str) -> dict[str, Any]:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            response.read()
+        with HTTP_OPENER.open(request, timeout=20) as response:
             return {
                 "enabled": True,
                 "sent": 200 <= response.status < 300,
@@ -1186,19 +1246,19 @@ def notify_chatwork(message: str) -> dict[str, Any]:
             }
 
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        exc.close()
         return {
             "enabled": True,
             "sent": False,
             "status": exc.code,
-            "error": redact_text(body)[:300],
+            "error": f"Chatwork API failed (HTTP {exc.code}).",
         }
 
-    except Exception as exc:
+    except Exception:
         return {
             "enabled": True,
             "sent": False,
-            "error": redact_text(exc),
+            "error": "Chatwork request failed.",
         }
 
 
@@ -1233,8 +1293,6 @@ def main() -> int:
     parser.add_argument("--config", default=str(PROJECT_ROOT / "config" / "rules.yml"))
     args = parser.parse_args()
 
-    load_dotenv(PROJECT_ROOT / ".env")
-
     config_path = Path(args.config).resolve()
 
     output: dict[str, Any] = {
@@ -1258,6 +1316,7 @@ def main() -> int:
     exit_code = 0
 
     try:
+        load_dotenv(PROJECT_ROOT / ".env")
         config = load_config(config_path)
         require_safe_config(config)
         require_token()
@@ -1316,7 +1375,7 @@ def main() -> int:
                     "provider": "gemini",
                     "sent_to_model": False,
                     "skipped": False,
-                    "error": redact_text(exc),
+                    "error": safe_error(exc),
                     "chatwork_message": "【配信テスト中】Meta広告 AI運用提案\n\n※AI提案生成失敗。停止・再開・バナー追加は自動実行していません。",
                 }
 
@@ -1332,7 +1391,7 @@ def main() -> int:
             if test_status_result.get("enabled") and not test_status_result.get("sent"):
                 output["errors"].append(
                     "Chatwork test status notification failed: "
-                    f"{redact_text(test_status_result.get('error') or test_status_result.get('status'))}"
+                    f"{test_status_result.get('error') or test_status_result.get('status')}"
                 )
 
         else:
@@ -1377,7 +1436,7 @@ def main() -> int:
                     if chatwork_result.get("enabled") and not chatwork_result.get("sent"):
                         output["errors"].append(
                             f"Chatwork notification failed for {record['ad_ref']}: "
-                            f"{redact_text(chatwork_result.get('error') or chatwork_result.get('status'))}"
+                            f"{chatwork_result.get('error') or chatwork_result.get('status')}"
                         )
 
                 except Exception as exc:
@@ -1386,11 +1445,11 @@ def main() -> int:
                         make_pause_summary_record(
                             match,
                             paused=False,
-                            error=redact_text(exc),
+                            error=safe_error(exc),
                         )
                     )
                     output["errors"].append(
-                        f"Pause failed for {public_ad_ref(match.ad['ad_id'])}: {redact_text(exc)}"
+                        f"Pause failed for {public_ad_ref(match.ad['ad_id'])}: {safe_error(exc)}"
                     )
 
         else:
@@ -1413,11 +1472,11 @@ def main() -> int:
             "errors": len(output["errors"]),
         }
 
-        print(json.dumps(output, ensure_ascii=False, indent=2))
+        print(json.dumps(redact_result(output), ensure_ascii=False, indent=2))
         return exit_code
 
     except Exception as exc:
-        output["errors"].append(redact_text(exc))
+        output["errors"].append(safe_error(exc))
         output["pause_summary"] = {
             "matched": 0,
             "selected_for_pause": 0,
@@ -1426,7 +1485,7 @@ def main() -> int:
             "not_paused": 0,
             "errors": len(output["errors"]),
         }
-        print(json.dumps(output, ensure_ascii=False, indent=2), file=sys.stderr)
+        print(json.dumps(redact_result(output), ensure_ascii=False, indent=2), file=sys.stderr)
         return 1
 
 
